@@ -1,0 +1,23 @@
+{
+  "name": "video-together",
+  "version": "1.0.0",
+  "private": true,
+  "description": "多人同步观看视频网站，包含独立同步节点和存储节点安装入口。",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:sync": "node sync-node/server.js",
+    "check": "node --check server.js && node --check sync-node/server.js"
+  },
+  "dependencies": {
+    "artplayer": "^5.4.0",
+    "bcryptjs": "^3.0.2",
+    "express": "^5.1.0",
+    "express-session": "^1.18.2",
+    "hls.js": "^1.6.13",
+    "multer": "^2.0.2",
+    "music-metadata": "^11.12.3",
+    "ssh2": "^1.17.0",
+    "ws": "^8.18.3"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "video52000-node",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Video Together sync/storage node.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "multer": "^2.0.2",
+    "ws": "^8.18.3"
+  }
+}
