@@ -20,6 +20,7 @@ const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const SECRET_FILE = path.join(DATA_DIR, 'secrets.json');
+const MEDIA_COVER_DIR = path.join(DATA_DIR, 'media-covers');
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const STORAGE_ROOT = process.env.VIDEO_STORAGE_ROOT || '/video52000/videos';
 const PORT = Number(process.env.PORT || 51999);
@@ -31,6 +32,7 @@ const DEFAULT_ADMIN_PASSWORD = String(process.env.DEFAULT_ADMIN_PASSWORD || 'cha
 const DEFAULT_ADMIN_DISPLAY_NAME = String(process.env.DEFAULT_ADMIN_DISPLAY_NAME || DEFAULT_ADMIN_USERNAME).trim() || DEFAULT_ADMIN_USERNAME;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(MEDIA_COVER_DIR, { recursive: true });
 fs.mkdirSync(STORAGE_ROOT, { recursive: true });
 
 const upload = multer({
@@ -607,12 +609,35 @@ function cleanupMediaCoverCache() {
   }
 }
 
+function mediaCoverExt(mime) {
+  const value = String(mime || '').toLowerCase();
+  if (value.includes('png')) return '.png';
+  if (value.includes('webp')) return '.webp';
+  if (value.includes('gif')) return '.gif';
+  return '.jpg';
+}
+
+function mediaCoverMimeFromName(name) {
+  const ext = path.extname(String(name || '')).toLowerCase();
+  if (ext === '.png') return 'image/png';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.gif') return 'image/gif';
+  return 'image/jpeg';
+}
+
 function storeMediaCover(picture) {
   if (!picture?.data?.length) return '';
   cleanupMediaCoverCache();
-  const id = randomId('cover');
+  const data = Buffer.from(picture.data);
+  const id = `${crypto.createHash('sha256').update(data).digest('hex')}${mediaCoverExt(picture.format)}`;
+  const file = path.join(MEDIA_COVER_DIR, id);
+  try {
+    if (!fs.existsSync(file)) fs.writeFileSync(file, data);
+  } catch {
+    return '';
+  }
   mediaCoverCache.set(id, {
-    data: Buffer.from(picture.data),
+    data,
     mime: picture.format || 'image/jpeg',
     expiresAt: Date.now() + MEDIA_COVER_TTL_MS
   });
@@ -2707,11 +2732,18 @@ app.post('/api/media/metadata', requireAuth, asyncRoute(async (req, res) => {
 
 app.get('/api/media/covers/:id', requireAuth, (req, res) => {
   cleanupMediaCoverCache();
-  const cover = mediaCoverCache.get(req.params.id);
-  if (!cover) return res.status(404).end();
-  res.setHeader('content-type', cover.mime);
+  const id = path.basename(String(req.params.id || ''));
+  const file = path.join(MEDIA_COVER_DIR, id);
+  const cover = mediaCoverCache.get(id);
+  if (cover) {
+    res.setHeader('content-type', cover.mime);
+    res.setHeader('cache-control', 'private, max-age=86400');
+    return res.send(cover.data);
+  }
+  if (!id || !fs.existsSync(file) || !fs.statSync(file).isFile()) return res.status(404).end();
+  res.setHeader('content-type', mediaCoverMimeFromName(id));
   res.setHeader('cache-control', 'private, max-age=1800');
-  res.send(cover.data);
+  res.sendFile(file);
 });
 
 app.get('/api/admin/sync-nodes', requireAuth, requireAdmin, (req, res) => {

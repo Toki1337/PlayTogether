@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Video Together</title>
   <link rel="icon" type="image/webp" href="/material/xiuzhen.webp?v=20260513-icon1">
-    <link rel="stylesheet" href="/styles.css?v=20260520-music19">
+    <link rel="stylesheet" href="/styles.css?v=20260520-storageui2">
   <script src="/vendor/artplayer.js"></script>
   <script src="/vendor/hls.js"></script>
-    <script defer src="/app.js?v=20260520-music19"></script>
+    <script defer src="/app.js?v=20260520-cover2"></script>
 </head>
 <body>
   <nav class="global-nav">
@@ -149,35 +149,25 @@
               </div>
               <div class="music-controls">
                 <button id="musicPrevBtn" class="secondary-pill icon-button" type="button" aria-label="上一首" title="上一首"><span class="button-icon icon-previous" aria-hidden="true"></span></button>
-                <button id="musicPlayBtn" class="primary-pill icon-button" type="button" aria-label="播放" title="播放"><span class="button-icon icon-play" aria-hidden="true"></span></button>
-                <button id="musicPauseBtn" class="secondary-pill icon-button" type="button" aria-label="暂停" title="暂停"><span class="button-icon icon-pause" aria-hidden="true"></span></button>
+                <button id="musicPlayBtn" class="secondary-pill icon-button play-toggle-button is-paused" type="button" aria-label="播放/暂停" title="播放/暂停"><span class="button-icon icon-pause" aria-hidden="true"></span></button>
                 <button id="musicNextBtn" class="secondary-pill icon-button" type="button" aria-label="下一首" title="下一首"><span class="button-icon icon-next" aria-hidden="true"></span></button>
               </div>
-              <form id="musicUrlForm" class="music-url-form">
-                <input id="musicUrlInput" class="url-input" placeholder="https://example.com/music.mp3">
-                <button id="musicAddUrlBtn" class="secondary-pill" type="submit">加入队列</button>
-                <button id="musicPlayUrlBtn" class="primary-pill" type="button">立即播放</button>
-              </form>
             </div>
-            <div class="control-strip">
-              <input id="videoUrlInput" class="url-input" placeholder="https://example.com/video.mp4">
-              <button id="addMediaQueueBtn" class="secondary-pill" type="button">加入队列</button>
-              <button id="switchVideoBtn" class="primary-pill" type="button">立即播放</button>
-              <button id="playBtn" class="secondary-pill icon-button" type="button" aria-label="播放" title="播放"><span class="button-icon icon-play" aria-hidden="true"></span></button>
-              <button id="pauseBtn" class="secondary-pill icon-button" type="button" aria-label="暂停" title="暂停"><span class="button-icon icon-pause" aria-hidden="true"></span></button>
+            <div class="transport-strip video-transport">
+              <button id="mediaPrevQueueBtn" class="secondary-pill icon-button" type="button" aria-label="上一集" title="上一集"><span class="button-icon icon-previous" aria-hidden="true"></span></button>
+              <button id="playBtn" class="secondary-pill icon-button play-toggle-button is-paused" type="button" aria-label="播放/暂停" title="播放/暂停"><span class="button-icon icon-pause" aria-hidden="true"></span></button>
+              <button id="mediaNextQueueBtn" class="secondary-pill icon-button" type="button" aria-label="下一集" title="下一集"><span class="button-icon icon-next" aria-hidden="true"></span></button>
             </div>
             <div id="queuePanel" class="media-queue-panel">
               <div class="section-head compact-head">
                 <h3 id="mediaQueueTitle">视频队列</h3>
                 <div class="section-actions">
+                  <button id="mediaClearQueueBtn" class="pearl-button" type="button">清空</button>
                   <select id="mediaPlaybackMode" class="compact-select" aria-label="队列播放模式">
                     <option value="sequence">顺序播放</option>
                     <option value="random">随机播放</option>
                     <option value="repeat-one">单曲循环</option>
                   </select>
-                  <button id="mediaPrevQueueBtn" class="pearl-button icon-button" type="button" aria-label="上一项" title="上一项"><span class="button-icon icon-previous" aria-hidden="true"></span></button>
-                  <button id="mediaNextQueueBtn" class="pearl-button icon-button" type="button" aria-label="下一项" title="下一项"><span class="button-icon icon-next" aria-hidden="true"></span></button>
-                  <button id="mediaClearQueueBtn" class="pearl-button" type="button">清空</button>
                 </div>
               </div>
               <div id="mediaQueueList" class="media-queue-list"></div>
@@ -192,8 +182,8 @@
               <div class="section-head">
                 <h3>媒体库</h3>
                 <div class="section-actions">
-                  <select id="storageNodeSelect"></select>
                   <button id="refreshStorageBrowserBtn" class="secondary-pill" type="button">刷新</button>
+                  <select id="storageNodeSelect"></select>
                 </div>
               </div>
               <div class="path-row">
@@ -202,6 +192,14 @@
               </div>
               <p id="storageBrowserStatus" class="panel-note"></p>
               <div id="storageFileList" class="file-grid"></div>
+              <details class="direct-link-menu">
+                <summary>直链播放</summary>
+                <div class="control-strip">
+                  <input id="videoUrlInput" class="url-input" placeholder="https://example.com/video.mp4">
+                  <button id="addMediaQueueBtn" class="secondary-pill" type="button">加入队列</button>
+                  <button id="switchVideoBtn" class="primary-pill" type="button">立即播放</button>
+                </div>
+              </details>
             </div>
           </div>
           <aside class="chat-column">

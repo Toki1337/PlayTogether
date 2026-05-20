@@ -60,6 +60,8 @@ const state = {
   musicLyricKey: '',
   musicMetadataInFlight: new Set(),
   musicMetadataNoLyrics: new Set(),
+  musicMetadataNoCover: new Set(),
+  musicCoverFailures: new Set(),
   mediaThumbCache: new Map(),
   storagePath: '',
   adminStoragePath: '',
@@ -175,6 +177,66 @@ function setBufferStatus(text = '缓冲状态 -', kind = 'muted') {
   if (!el) return;
   el.textContent = text;
   el.className = statusClass(kind);
+}
+
+function feedbackKindFromText(text = '') {
+  if (/上一|上移/.test(text)) return 'prev';
+  if (/下一|下移/.test(text)) return 'next';
+  if (/加入|添加|创建/.test(text)) return 'add';
+  if (/播放|进入/.test(text)) return 'play';
+  if (/暂停/.test(text)) return 'pause';
+  if (/清空|清除|清理|移除|删除|取消/.test(text)) return 'clear';
+  return 'press';
+}
+
+function triggerButtonFeedback(button, kind = 'press') {
+  if (!button || prefersReducedMotion()) return;
+  const feedbackClass = `feedback-${kind}`;
+  button.classList.remove('control-feedback', 'feedback-press', 'feedback-play', 'feedback-pause', 'feedback-next', 'feedback-prev', 'feedback-add', 'feedback-clear');
+  void button.offsetWidth;
+  button.classList.add('control-feedback', feedbackClass);
+  window.setTimeout(() => {
+    button.classList.remove('control-feedback', feedbackClass);
+  }, 460);
+}
+
+function setPlaybackToggleButton(button, isPlaying) {
+  if (!button) return;
+  const icon = button.querySelector('.button-icon');
+  button.classList.toggle('is-playing', isPlaying);
+  button.classList.toggle('is-paused', !isPlaying);
+  button.setAttribute('aria-label', isPlaying ? '暂停' : '播放');
+  button.title = isPlaying ? '暂停' : '播放';
+  if (icon) {
+    icon.classList.toggle('icon-play', isPlaying);
+    icon.classList.toggle('icon-pause', !isPlaying);
+  }
+}
+
+function renderPlaybackControls() {
+  const isPlaying = Boolean(state.currentMediaUrl && state.desiredPlaying);
+  setPlaybackToggleButton($('#playBtn'), isPlaying);
+  setPlaybackToggleButton($('#musicPlayBtn'), isPlaying && state.currentMediaType === 'audio');
+}
+
+function toggleCurrentPlayback(button) {
+  const shouldPause = Boolean(state.currentMediaUrl && state.desiredPlaying);
+  triggerButtonFeedback(button, shouldPause ? 'pause' : 'play');
+  markMediaIntent();
+  if (!state.currentMediaUrl) {
+    renderPlaybackControls();
+    return toast('请先选择媒体');
+  }
+  if (shouldPause) {
+    commitLocalPause('pause');
+    suppressLocalMediaEvents(500);
+    pauseMedia();
+  } else {
+    commitLocalPlay('play');
+    suppressLocalMediaEvents(500);
+    playMedia().catch(() => scheduleCatchup('等待播放'));
+  }
+  renderPlaybackControls();
 }
 
 function renderEmpty(target, text) {
@@ -728,8 +790,8 @@ function localRoomStatePatch(isPlaying, position = getMediaTime()) {
   };
 }
 
-function commitLocalSeek(reason = 'seek') {
-  if (!state.currentMediaUrl || Date.now() <= state.suppressUntil) return;
+function commitLocalSeek(reason = 'seek', options = {}) {
+  if (!state.currentMediaUrl || (!options.force && Date.now() <= state.suppressUntil)) return;
   const isPlaying = !getMediaPaused();
   const position = localSeekCommitPosition();
   state.lastLocalControlAt = Date.now();
@@ -745,6 +807,7 @@ function commitLocalPlay(reason = 'play') {
   markLocalPlay();
   clearCatchupStatus(0);
   renderMediaQueue();
+  renderPlaybackControls();
   sendState(reason, { isPlaying: true });
 }
 
@@ -756,6 +819,7 @@ function commitLocalPause(reason = 'pause') {
   clearCatchupStatus(0);
   setPlaybackRate(1);
   renderMediaQueue();
+  renderPlaybackControls();
   sendState(reason, { isPlaying: false });
 }
 
@@ -790,6 +854,10 @@ function bufferedAheadAt(media, time) {
 
 function hasBufferedTarget(media, target, minAhead = 0.75) {
   return bufferedAheadAt(media, target) >= minAhead;
+}
+
+function canApplyProgressSeek(media, target) {
+  return hasBufferedTarget(media, target, 0.5) || mediaCanSeek(media) || media?.readyState >= 3;
 }
 
 function clearCatchupStatus(delay = 1800) {
@@ -880,7 +948,7 @@ function runCatchup() {
     clearCatchupStatus();
     return;
   }
-  if (hasBufferedTarget(media, target, 0.5) || media.readyState >= 3) {
+  if (canApplyProgressSeek(media, target)) {
     seekMediaTo(target, 900);
   }
   const ahead = bufferedAheadAt(media, media.currentTime || 0);
@@ -932,6 +1000,7 @@ function updateMediaModeUi() {
   const isAudioMode = state.roomMode === 'audio';
   $('.player-shell')?.classList.toggle('hidden', isAudioMode);
   $('#musicPanel')?.classList.toggle('hidden', !isAudioMode);
+  $('.video-transport')?.classList.toggle('hidden', isAudioMode);
   $('#roomModeVideoBtn')?.classList.toggle('active', state.roomMode === 'video');
   $('#roomModeAudioBtn')?.classList.toggle('active', state.roomMode === 'audio');
   const input = $('#videoUrlInput');
@@ -944,6 +1013,7 @@ function updateMediaModeUi() {
   if (modeSelect) modeSelect.value = playbackModeFor(state.roomMode);
   renderMusicPanel();
   renderMediaQueue();
+  renderPlaybackControls();
 }
 
 function stopInactiveMedia(nextType) {
@@ -1052,19 +1122,67 @@ function currentTrackFromQueue(type = state.currentMediaType) {
   return queueFor(type).find((track) => track.id === state.currentTrackId) || null;
 }
 
+function coverImageValue(url) {
+  return `url(${JSON.stringify(url)})`;
+}
+
+function preloadCoverImage(url) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(url);
+    image.onerror = reject;
+    image.src = url;
+  });
+}
+
+function applyMusicCover(cover, meta) {
+  if (!cover) return;
+  const title = meta.title || '音';
+  const fallbackText = title.slice(0, 1).toUpperCase();
+  const coverUrl = meta.coverUrl || '';
+  if (!coverUrl || state.musicCoverFailures.has(coverUrl)) {
+    cover.classList.remove('has-cover');
+    cover.dataset.coverUrl = coverUrl;
+    cover.style.backgroundImage = '';
+    cover.textContent = fallbackText;
+    return;
+  }
+  if (cover.dataset.coverUrl === coverUrl && cover.classList.contains('has-cover')) return;
+  cover.dataset.coverUrl = coverUrl;
+  cover.classList.remove('has-cover');
+  cover.style.backgroundImage = '';
+  cover.textContent = fallbackText;
+  preloadCoverImage(coverUrl)
+    .then(() => {
+      if (!cover.isConnected || cover.dataset.coverUrl !== coverUrl) return;
+      state.musicCoverFailures.delete(coverUrl);
+      cover.style.backgroundImage = coverImageValue(coverUrl);
+      cover.textContent = '';
+      cover.classList.add('has-cover');
+    })
+    .catch(() => {
+      if (!cover.isConnected || cover.dataset.coverUrl !== coverUrl) return;
+      state.musicCoverFailures.add(coverUrl);
+      cover.classList.remove('has-cover');
+      cover.style.backgroundImage = '';
+      cover.textContent = fallbackText;
+      ensureCurrentAudioMetadata(true);
+    });
+}
+
 function renderMusicPanel() {
-  const meta = normalizeMusicMeta(state.currentMediaMeta || currentTrackFromQueue(), { mediaUrl: state.currentMediaUrl });
+  const queueMeta = currentTrackFromQueue('audio');
+  const meta = mergeMusicMeta(queueMeta, state.currentMediaMeta, { mediaUrl: state.currentMediaUrl });
+  if (state.currentMediaType === 'audio' && state.currentMediaUrl) state.currentMediaMeta = meta;
   const title = $('#musicTitle');
   const artist = $('#musicArtist');
   const cover = $('#musicCover');
   if (title) title.textContent = state.currentMediaType === 'audio' && state.currentMediaUrl ? meta.title : '未选择音乐';
-  if (artist) artist.textContent = state.currentMediaType === 'audio' && state.currentMediaUrl ? (meta.artist || meta.album || '未知艺术家') : '从媒体库或直链添加歌曲';
-  if (cover) {
-    cover.textContent = meta.coverUrl ? '' : (meta.title || '音').slice(0, 1).toUpperCase();
-    cover.style.backgroundImage = meta.coverUrl ? `url("${meta.coverUrl}")` : '';
-  }
+  if (artist) artist.textContent = state.currentMediaType === 'audio' && state.currentMediaUrl ? (meta.artist || meta.album || '未知艺术家') : '从媒体库或直链菜单添加歌曲';
+  applyMusicCover(cover, meta);
   ensureCurrentAudioMetadata();
   updateMusicProgressUi();
+  renderPlaybackControls();
 }
 
 function mediaQueueRenderKey(mediaType, queue) {
@@ -1131,7 +1249,10 @@ function renderMediaQueue() {
     const main = document.createElement('button');
     main.className = 'music-queue-main';
     main.type = 'button';
-    main.addEventListener('click', () => sendQueueMessage('queue_play', { mediaType, trackId: track.id }));
+    main.addEventListener('click', () => {
+      triggerButtonFeedback(main, 'play');
+      sendQueueMessage('queue_play', { mediaType, trackId: track.id });
+    });
     const name = document.createElement('strong');
     name.textContent = trackTitle;
     const meta = document.createElement('span');
@@ -1341,7 +1462,8 @@ async function enrichAudioTrackMetadata(track) {
       method: 'POST',
       body: { url: track.mediaUrl, name: track.sourceName || track.title }
     });
-    const meta = normalizeMusicMeta(data.metadata, { mediaUrl: track.mediaUrl, title: track.title });
+    const meta = mergeMusicMeta(track, data.metadata, { mediaUrl: track.mediaUrl, title: track.title, name: track.sourceName || track.title });
+    Object.assign(track, meta);
     sendQueueMessage('queue_update', {
       mediaType: 'audio',
       trackId: track.id,
@@ -1350,11 +1472,15 @@ async function enrichAudioTrackMetadata(track) {
   } catch {}
 }
 
-function ensureCurrentAudioMetadata() {
+function ensureCurrentAudioMetadata(force = false) {
   if (state.currentMediaType !== 'audio' || !state.currentMediaUrl) return;
   const url = state.currentMediaUrl;
-  const currentMeta = normalizeMusicMeta(state.currentMediaMeta || currentTrackFromQueue('audio'), { mediaUrl: url });
-  if (currentMeta.lyrics || state.musicMetadataInFlight.has(url) || state.musicMetadataNoLyrics.has(url)) return;
+  const currentMeta = mergeMusicMeta(currentTrackFromQueue('audio'), state.currentMediaMeta, { mediaUrl: url });
+  const coverFailed = currentMeta.coverUrl && state.musicCoverFailures.has(currentMeta.coverUrl);
+  const lyricsDone = Boolean(currentMeta.lyrics) || state.musicMetadataNoLyrics.has(url);
+  const coverDone = Boolean(currentMeta.coverUrl && !coverFailed) || state.musicMetadataNoCover.has(url);
+  if (!force && lyricsDone && coverDone) return;
+  if (state.musicMetadataInFlight.has(url)) return;
   state.musicMetadataInFlight.add(url);
   api('/api/media/metadata', {
     method: 'POST',
@@ -1364,12 +1490,20 @@ function ensureCurrentAudioMetadata() {
     }
   }).then((data) => {
     if (state.currentMediaUrl !== url || state.currentMediaType !== 'audio') return;
-    const meta = normalizeMusicMeta(data.metadata, { mediaUrl: url, title: currentMeta.title });
+    const meta = mergeMusicMeta(currentMeta, data.metadata, { mediaUrl: url, title: currentMeta.title, name: currentMeta.sourceName || currentMeta.title });
     if (!meta.lyrics) state.musicMetadataNoLyrics.add(url);
+    else state.musicMetadataNoLyrics.delete(url);
+    if (!meta.coverUrl) state.musicMetadataNoCover.add(url);
+    else state.musicMetadataNoCover.delete(url);
     state.currentMediaMeta = meta;
     const track = currentTrackFromQueue('audio');
     if (track && track.mediaUrl === url) Object.assign(track, meta);
-    if (track?.id && meta.lyrics) {
+    const hasUsefulUpdate = meta.lyrics
+      || meta.coverUrl !== currentMeta.coverUrl
+      || meta.title !== currentMeta.title
+      || meta.artist !== currentMeta.artist
+      || meta.album !== currentMeta.album;
+    if (track?.id && hasUsefulUpdate) {
       sendQueueMessage('queue_update', {
         mediaType: 'audio',
         trackId: track.id,
@@ -1452,7 +1586,10 @@ function applyRemoteState(remote, reason = 'state_sync') {
   state.playbackModes = normalizePlaybackModes(remote.playbackModes || state.playbackModes);
   state.musicQueue = state.mediaQueues.audio;
   state.currentTrackId = remote.currentTrackId || '';
-  state.currentMediaMeta = remote.mediaMeta ? normalizeMusicMeta(remote.mediaMeta, { mediaUrl: remoteMediaUrl }) : state.currentMediaMeta;
+  const localMeta = mergeMusicMeta(currentTrackFromQueue(remoteMediaType), state.currentMediaMeta, { mediaUrl: remoteMediaUrl });
+  state.currentMediaMeta = remote.mediaMeta
+    ? mergeMusicMeta(localMeta, remote.mediaMeta, { mediaUrl: remoteMediaUrl })
+    : state.currentMediaMeta;
   updateMediaModeUi();
   const target = remoteTargetPosition(remote);
   if (remoteMediaUrl !== state.currentMediaUrl || remoteMediaType !== state.currentMediaType) {
@@ -1471,51 +1608,49 @@ function applyRemoteState(remote, reason = 'state_sync') {
   const player = getMedia();
   if (!player) return;
   const isPeriodicSync = reason === 'state_sync';
-  if (isPeriodicSync && (hasLocalSeekIntent() || player.seeking) && !isNewerRemoteState) return;
-  state.latestRemoteState = remote;
   const drift = remoteProgressDrift(remote, player);
+  if (isPeriodicSync && (hasLocalSeekIntent() || player.seeking) && !isNewerRemoteState) return;
+  if (isPeriodicSync && !isNewerRemoteState && remote.isPlaying && hasExplicitPauseIntent()) return;
+  if (isPeriodicSync && !isNewerRemoteState && !remote.isPlaying && hasLocalPlayIntent()) return;
+  state.latestRemoteState = remote;
   const shouldApplyProgressSync = !isPeriodicSync || Math.abs(drift) > PROGRESS_SYNC_THRESHOLD_SECONDS;
+  state.desiredPlaying = Boolean(remote.isPlaying);
+  if (!remote.isPlaying) state.pendingAutoplay = false;
+  renderMediaQueue();
+  updateMusicProgressUi();
+  renderPlaybackControls();
   if (!shouldApplyProgressSync) {
-    state.desiredPlaying = Boolean(remote.isPlaying);
-    renderMediaQueue();
-    updateMusicProgressUi();
     clearCatchupStatus(0);
     if (!player.paused) setPlaybackRate(1);
-    return;
-  }
-  const seekThreshold = isPeriodicSync ? PROGRESS_SYNC_THRESHOLD_SECONDS : 0.35;
-  if (remote.isPlaying) {
-    if (hasExplicitPauseIntent() && !isNewerRemoteState) return;
-    state.desiredPlaying = true;
-    renderMediaQueue();
-    updateMusicProgressUi();
-    if (state.sourceLoading) {
-      setPendingSeek(target);
-      state.pendingAutoplay = true;
-      return;
-    }
-    applyPendingSeek();
-    if (Math.abs(drift) > seekThreshold) {
-      if (hasBufferedTarget(player, target, 0.5) || player.readyState >= 3) {
-        seekMediaTo(target, 900);
-      } else {
-        scheduleCatchup('缓存追赶');
-      }
-    } else if (Math.abs(drift) < 0.45) {
-      setPlaybackRate(1);
-    }
   } else {
-    state.desiredPlaying = false;
-    renderMediaQueue();
-    updateMusicProgressUi();
-    clearCatchupStatus(0);
-    state.pendingAutoplay = false;
-    if (state.sourceLoading) {
-      setPendingSeek(target);
-      return;
+    const seekThreshold = isPeriodicSync ? PROGRESS_SYNC_THRESHOLD_SECONDS : 0.35;
+    if (remote.isPlaying) {
+      if (hasExplicitPauseIntent() && !isNewerRemoteState) return;
+      if (state.sourceLoading) {
+        setPendingSeek(target);
+        state.pendingAutoplay = true;
+        return;
+      }
+      applyPendingSeek();
+      if (Math.abs(drift) > seekThreshold) {
+        if (canApplyProgressSeek(player, target)) {
+          seekMediaTo(target, 900);
+        } else {
+          scheduleCatchup('缓存追赶');
+        }
+      } else if (Math.abs(drift) < 0.45) {
+        setPlaybackRate(1);
+      }
+    } else {
+      clearCatchupStatus(0);
+      state.pendingAutoplay = false;
+      if (state.sourceLoading) {
+        setPendingSeek(target);
+        return;
+      }
+      applyPendingSeek();
+      if (Number.isFinite(target) && Math.abs(drift) > seekThreshold) seekMediaTo(target, 900);
     }
-    applyPendingSeek();
-    if (Number.isFinite(target) && Math.abs(drift) > seekThreshold) seekMediaTo(target, 900);
   }
   if (remote.isPlaying && state.currentMediaUrl && player.paused) {
     if (hasExplicitPauseIntent() && !isNewerRemoteState) return;
@@ -1528,6 +1663,7 @@ function applyRemoteState(remote, reason = 'state_sync') {
     state.desiredPlaying = false;
     renderMediaQueue();
     updateMusicProgressUi();
+    renderPlaybackControls();
     const explicitRemotePause = reason === 'pause' || reason === 'snapshot' || isNewerRemoteState;
     if (explicitRemotePause || !hasLocalPlayIntent()) {
       suppressLocalMediaEvents(1200);
@@ -1760,8 +1896,20 @@ function hydrateFileThumbnail(entry, thumb) {
   if (!entry?.isAudio || !thumb) return;
   audioThumbMetadata(entry).then((meta) => {
     if (!thumb.isConnected || !meta?.coverUrl) return;
-    thumb.style.backgroundImage = `url(${JSON.stringify(meta.coverUrl)})`;
-    thumb.classList.add('has-cover');
+    const coverImage = `url(${JSON.stringify(meta.coverUrl)})`;
+    preloadCoverImage(meta.coverUrl).then(() => {
+      if (!thumb.isConnected) return;
+      let cover = thumb.querySelector('.file-cover-art');
+      if (!cover) {
+        cover = document.createElement('span');
+        cover.className = 'file-cover-art';
+        cover.setAttribute('aria-hidden', 'true');
+        thumb.appendChild(cover);
+      }
+      thumb.style.setProperty('--file-cover-url', coverImage);
+      cover.style.backgroundImage = coverImage;
+      thumb.classList.add('has-cover');
+    }).catch(() => {});
   });
 }
 
@@ -1980,6 +2128,24 @@ function normalizeMusicMeta(meta, fallback = {}) {
     duration: Number.isFinite(Number(meta?.duration)) ? Math.max(0, Number(meta.duration)) : null,
     sourceName: String(meta?.sourceName || base.sourceName || '').slice(0, 180),
     lyrics: normalizeLyrics(meta?.lyrics || base.lyrics)
+  };
+}
+
+function mergeMusicMeta(existing, incoming, fallback = {}) {
+  const current = normalizeMusicMeta(existing, fallback);
+  const next = normalizeMusicMeta(incoming, {
+    ...fallback,
+    title: current.title,
+    name: current.sourceName || current.title
+  });
+  return {
+    title: next.title || current.title,
+    artist: next.artist || current.artist,
+    album: next.album || current.album,
+    coverUrl: next.coverUrl || current.coverUrl,
+    duration: next.duration ?? current.duration,
+    sourceName: next.sourceName || current.sourceName,
+    lyrics: next.lyrics || current.lyrics
   };
 }
 
@@ -2572,7 +2738,10 @@ function actionButton(text, cls, handler) {
   button.type = 'button';
   button.className = cls;
   button.textContent = text;
-  button.addEventListener('click', handler);
+  button.addEventListener('click', (event) => {
+    triggerButtonFeedback(button, feedbackKindFromText(text));
+    handler?.(event);
+  });
   return button;
 }
 
@@ -3038,7 +3207,7 @@ function bindEvents() {
       setPlaybackRate(1);
       setBufferStatus('正在定位', 'warn');
       clearTimeout(state.seekCommitTimer);
-      state.seekCommitTimer = setTimeout(() => commitLocalSeek('seek'), 180);
+      state.seekCommitTimer = setTimeout(() => commitLocalSeek('seek', { force: true }), 180);
     });
     bindPlayerEvent('play', () => {
       ensureVideoVisible();
@@ -3046,9 +3215,11 @@ function bindEvents() {
       markLocalPlay();
       setBufferStatus('播放中', 'good');
       if (Date.now() > state.suppressUntil) commitLocalPlay('play');
+      renderPlaybackControls();
     });
     bindPlayerEvent('pause', () => {
       clearTimeout(state.pendingPauseTimer);
+      renderPlaybackControls();
       if (Date.now() <= state.suppressUntil) return;
       if (hasExplicitPauseIntent()) {
         commitLocalPause('pause');
@@ -3105,7 +3276,7 @@ function bindEvents() {
       markLocalSeekIntent(LOCAL_SEEK_COMMIT_LOCK_MS);
       clearTimeout(state.seekCommitTimer);
       state.seekCommitTimer = setTimeout(() => {
-        commitLocalSeek('seek');
+        commitLocalSeek('seek', { force: true });
       }, 140);
     });
     bindPlayerEvent('ended', () => {
@@ -3150,12 +3321,14 @@ function bindEvents() {
       if (Date.now() > state.suppressUntil) commitLocalPlay('play');
       updateMusicProgressUi();
       renderMediaQueue();
+      renderPlaybackControls();
     });
     bindAudioEvent('pause', () => {
       if (state.currentMediaType !== 'audio') return;
       clearTimeout(state.pendingPauseTimer);
       updateMusicProgressUi();
       renderMediaQueue();
+      renderPlaybackControls();
       if (Date.now() <= state.suppressUntil) return;
       if (hasExplicitPauseIntent()) {
         commitLocalPause('pause');
@@ -3209,14 +3382,15 @@ function bindEvents() {
       if (state.currentMediaType !== 'audio' || hasProgrammaticSeekIntent()) return;
       markLocalSeekIntent(LOCAL_SEEK_COMMIT_LOCK_MS);
       clearTimeout(state.seekCommitTimer);
-      state.seekCommitTimer = setTimeout(() => commitLocalSeek('seek'), 140);
+      state.seekCommitTimer = setTimeout(() => commitLocalSeek('seek', { force: true }), 140);
       updateMusicProgressUi();
     });
     bindAudioEvent('ended', () => {
       if (state.currentMediaType === 'audio') sendQueueMessage('queue_next', { mediaType: 'audio', ended: true });
     });
   }
-  $('#switchVideoBtn').addEventListener('click', () => {
+  $('#switchVideoBtn').addEventListener('click', (event) => {
+    triggerButtonFeedback(event.currentTarget, 'play');
     markMediaIntent();
     const url = normalizeMediaInput($('#videoUrlInput').value);
     if (url === null) return toast(`请输入 http(s) 或 /videos 开头的${modeLabel()}地址`);
@@ -3225,41 +3399,37 @@ function bindEvents() {
       if (ok) $('#videoUrlInput').value = '';
     }).catch((error) => toast(error.message));
   });
-  $('#addMediaQueueBtn')?.addEventListener('click', async () => {
+  $('#addMediaQueueBtn')?.addEventListener('click', async (event) => {
     const ok = await addMediaTrack($('#videoUrlInput').value, { mediaType: state.roomMode, playNow: false });
-    if (ok) $('#videoUrlInput').value = '';
+    if (ok) {
+      triggerButtonFeedback(event.currentTarget, 'add');
+      $('#videoUrlInput').value = '';
+    }
   });
   $('#roomModeVideoBtn')?.addEventListener('click', () => requestRoomMode('video'));
   $('#roomModeAudioBtn')?.addEventListener('click', () => requestRoomMode('audio'));
-  $('#playBtn').addEventListener('click', () => {
-    markMediaIntent();
-    if (state.currentMediaUrl) commitLocalPlay('play');
-    suppressLocalMediaEvents(500);
-    playMedia().catch(() => scheduleCatchup('等待播放'));
+  $('#playBtn')?.addEventListener('click', (event) => toggleCurrentPlayback(event.currentTarget));
+  $('#musicPlayBtn')?.addEventListener('click', (event) => toggleCurrentPlayback(event.currentTarget));
+  $('#musicPrevBtn')?.addEventListener('click', (event) => {
+    triggerButtonFeedback(event.currentTarget, 'prev');
+    sendQueueMessage('queue_previous', { mediaType: 'audio' });
   });
-  $('#pauseBtn').addEventListener('click', () => {
-    markMediaIntent();
-    commitLocalPause('pause');
-    suppressLocalMediaEvents(500);
-    pauseMedia();
+  $('#musicNextBtn')?.addEventListener('click', (event) => {
+    triggerButtonFeedback(event.currentTarget, 'next');
+    sendQueueMessage('queue_next', { mediaType: 'audio' });
   });
-  $('#musicPlayBtn')?.addEventListener('click', () => {
-    markMediaIntent();
-    if (state.currentMediaUrl) commitLocalPlay('play');
-    suppressLocalMediaEvents(500);
-    playMedia().catch(() => scheduleCatchup('等待播放'));
+  $('#mediaPrevQueueBtn')?.addEventListener('click', (event) => {
+    triggerButtonFeedback(event.currentTarget, 'prev');
+    sendQueueMessage('queue_previous', { mediaType: state.roomMode });
   });
-  $('#musicPauseBtn')?.addEventListener('click', () => {
-    markMediaIntent();
-    commitLocalPause('pause');
-    suppressLocalMediaEvents(500);
-    pauseMedia();
+  $('#mediaNextQueueBtn')?.addEventListener('click', (event) => {
+    triggerButtonFeedback(event.currentTarget, 'next');
+    sendQueueMessage('queue_next', { mediaType: state.roomMode });
   });
-  $('#musicPrevBtn')?.addEventListener('click', () => sendQueueMessage('queue_previous', { mediaType: 'audio' }));
-  $('#musicNextBtn')?.addEventListener('click', () => sendQueueMessage('queue_next', { mediaType: 'audio' }));
-  $('#mediaPrevQueueBtn')?.addEventListener('click', () => sendQueueMessage('queue_previous', { mediaType: state.roomMode }));
-  $('#mediaNextQueueBtn')?.addEventListener('click', () => sendQueueMessage('queue_next', { mediaType: state.roomMode }));
-  $('#mediaClearQueueBtn')?.addEventListener('click', () => sendQueueMessage('queue_clear', { mediaType: state.roomMode }));
+  $('#mediaClearQueueBtn')?.addEventListener('click', (event) => {
+    triggerButtonFeedback(event.currentTarget, 'clear');
+    sendQueueMessage('queue_clear', { mediaType: state.roomMode });
+  });
   $('#mediaPlaybackMode')?.addEventListener('change', (event) => {
     const mediaType = state.roomMode;
     const playbackMode = normalizePlaybackMode(event.target.value);
@@ -3274,20 +3444,13 @@ function bindEvents() {
     const target = (Number($('#musicProgress').value || 0) / 1000) * duration;
     rememberLocalSeekTarget(target);
     markLocalSeekIntent(LOCAL_SEEK_LOCK_MS);
-    seekMediaTo(target, 500);
+    try {
+      media.currentTime = Math.max(0, target);
+    } catch {}
     updateMusicProgressUi();
   });
-  $('#musicProgress')?.addEventListener('change', () => commitLocalSeek('seek'));
+  $('#musicProgress')?.addEventListener('change', () => commitLocalSeek('seek', { force: true }));
   window.addEventListener('resize', () => updateMusicProgressUi());
-  $('#musicUrlForm')?.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const ok = await addMusicTrack($('#musicUrlInput').value, { playNow: false });
-    if (ok) $('#musicUrlInput').value = '';
-  });
-  $('#musicPlayUrlBtn')?.addEventListener('click', async () => {
-    const ok = await addMusicTrack($('#musicUrlInput').value, { playNow: true });
-    if (ok) $('#musicUrlInput').value = '';
-  });
   $('#chatForm').addEventListener('submit', (event) => {
     event.preventDefault();
     const text = $('#chatInput').value.trim();
