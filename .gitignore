@@ -9,6 +9,9 @@ data/*.json
 sync-node/.env
 sync-node/.env.*
 !sync-node/.env.example
+sync-node/rooms.json
+sync-node/rooms.json.*.tmp
+sync-node/node_modules/
 .well-known/
 .user.ini
 .htaccess

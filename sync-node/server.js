@@ -36,11 +36,21 @@ const PORT = Number(process.env.PORT || 52000);
 const NODE_TOKEN = process.env.NODE_TOKEN || fallbackNodeToken();
 const ROLES = new Set(String(process.env.NODE_ROLES || 'sync,storage').split(',').map((role) => role.trim()).filter(Boolean));
 const STORAGE_ROOT = process.env.VIDEO_STORAGE_ROOT || '/video52000/videos';
+const UPLOAD_TMP_DIR = path.join(STORAGE_ROOT, '.uploads-tmp');
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 2048);
 const TLS_CERT_PATH = process.env.TLS_CERT_PATH || '';
 const TLS_KEY_PATH = process.env.TLS_KEY_PATH || '';
+const SYNC_STATE_FILE = process.env.SYNC_STATE_FILE || path.join(__dirname, 'rooms.json');
+const WS_HEARTBEAT_MS = 30000;
+const WS_MAX_PAYLOAD = 256 * 1024;
+const ROOM_EMPTY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const ENDED_DEDUPE_WINDOW_MS = 2500;
+const CHAT_BURST = 5;
+const CHAT_REFILL_PER_SECOND = 1;
+const TEXT_LIMITS = { title: 160, artist: 120, album: 120, sourceName: 180, coverUrl: 3000 };
 
 fs.mkdirSync(STORAGE_ROOT, { recursive: true });
+fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
 
 const app = express();
 const tlsEnabled = Boolean(TLS_CERT_PATH && TLS_KEY_PATH);
@@ -51,13 +61,46 @@ const server = tlsEnabled
     key: fs.readFileSync(TLS_KEY_PATH)
   }, app)
   : http.createServer(app);
+// Uploads stream to disk next to their destination so the final step is a rename, not a 2 GB buffer.
 const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024 }
+  storage: multer.diskStorage({
+    destination: UPLOAD_TMP_DIR,
+    filename: (req, file, cb) => cb(null, `upload_${crypto.randomBytes(10).toString('hex')}`)
+  }),
+  defParamCharset: 'utf8',
+  limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024, files: 1 }
 });
 
 function now() {
   return new Date().toISOString();
+}
+
+async function moveFile(from, to) {
+  try {
+    await fs.promises.rename(from, to);
+  } catch (error) {
+    if (error.code !== 'EXDEV') throw error;
+    await fs.promises.copyFile(from, to);
+    await fs.promises.unlink(from);
+  }
+}
+
+async function discardUpload(file) {
+  if (file?.path) await fs.promises.unlink(file.path).catch(() => {});
+}
+
+async function pruneUploadTmpFiles() {
+  const names = await fs.promises.readdir(UPLOAD_TMP_DIR).catch(() => []);
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  for (const name of names) {
+    const file = path.join(UPLOAD_TMP_DIR, name);
+    const stat = await fs.promises.stat(file).catch(() => null);
+    if (stat?.isFile() && stat.mtimeMs < cutoff) await fs.promises.unlink(file).catch(() => {});
+  }
+}
+
+function isHiddenEntry(name) {
+  return String(name || '').startsWith('.');
 }
 
 function cleanRelativePath(input) {
@@ -379,13 +422,26 @@ function verifyRoomToken(token) {
   return payload;
 }
 
-function listDir(rel) {
+// Listing is read-only: a missing directory is a 404, never created as a side effect of a GET.
+async function listDir(rel) {
   const safeRel = cleanRelativePath(rel);
   const dir = fullStoragePath(STORAGE_ROOT, safeRel);
-  fs.mkdirSync(dir, { recursive: true });
-  const entries = fs.readdirSync(dir, { withFileTypes: true }).map((entry) => {
+  let dirents;
+  try {
+    dirents = await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+      const err = new Error('目录不存在。');
+      err.status = 404;
+      throw err;
+    }
+    throw error;
+  }
+  const entries = (await Promise.all(dirents.map(async (entry) => {
+    if (isHiddenEntry(entry.name) || (!entry.isFile() && !entry.isDirectory())) return null;
+    const stat = await fs.promises.stat(path.join(dir, entry.name)).catch(() => null);
+    if (!stat) return null;
     const childRel = cleanRelativePath(path.posix.join(safeRel, entry.name));
-    const stat = fs.statSync(path.join(dir, entry.name));
     const mediaType = entry.isFile() ? mediaTypeForFile(entry.name) : '';
     const mediaUrl = entry.isFile() ? `/videos/${encodePathForUrl(childRel)}` : null;
     return {
@@ -401,7 +457,7 @@ function listDir(rel) {
       mediaUrl,
       videoUrl: mediaUrl
     };
-  });
+  }))).filter(Boolean);
   entries.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
   return { path: safeRel, entries };
 }
@@ -436,8 +492,8 @@ app.use('/videos', requireRole('storage'), express.static(STORAGE_ROOT, {
   }
 }));
 
-app.get('/storage/list', requireRole('storage'), requireNodeToken, (req, res) => {
-  res.json(listDir(req.query.path || ''));
+app.get('/storage/list', requireRole('storage'), requireNodeToken, async (req, res) => {
+  res.json(await listDir(req.query.path || ''));
 });
 
 app.post('/storage/mkdir', requireRole('storage'), requireNodeToken, (req, res) => {
@@ -454,14 +510,19 @@ app.post('/storage/delete', requireRole('storage'), requireNodeToken, (req, res)
   res.json({ ok: true });
 });
 
-app.post('/storage/upload', requireRole('storage'), requireNodeToken, upload.single('file'), (req, res) => {
-  if (!req.file) return res.status(400).json({ error: '请选择文件。' });
-  const dirRel = cleanRelativePath(req.body.path || '');
-  const filename = path.basename(req.file.originalname || 'video.bin');
-  const dir = fullStoragePath(STORAGE_ROOT, dirRel);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, filename), req.file.buffer);
-  res.json({ ok: true, path: cleanRelativePath(path.posix.join(dirRel, filename)) });
+app.post('/storage/upload', requireRole('storage'), requireNodeToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: '请选择文件。' });
+    const dirRel = cleanRelativePath(req.body.path || '');
+    const filename = safeFilename(req.file.originalname, 'video.bin');
+    const targetRel = cleanRelativePath(path.posix.join(dirRel, filename));
+    const dir = fullStoragePath(STORAGE_ROOT, dirRel);
+    await fs.promises.mkdir(dir, { recursive: true });
+    await moveFile(req.file.path, fullStoragePath(STORAGE_ROOT, targetRel));
+    res.json({ ok: true, path: targetRel });
+  } finally {
+    await discardUpload(req.file);
+  }
 });
 
 app.get('/storage/downloads', requireRole('storage'), requireNodeToken, (req, res) => {
@@ -489,10 +550,89 @@ app.delete('/storage/downloads/:id', requireRole('storage'), requireNodeToken, (
 });
 
 const rooms = new Map();
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD });
+let roomStateFlushTimer = null;
 
 function safeShortText(value, limit = 180) {
   return String(value || '').trim().slice(0, limit);
+}
+
+// Room state (queues, modes, last messages) is checkpointed to disk so a node restart or update
+// does not wipe every room's queue. Writes are debounced; members are runtime-only.
+function writeRoomsNow() {
+  if (!ROLES.has('sync')) return;
+  const snapshot = {};
+  for (const [id, room] of rooms) {
+    const current = computedState(room);
+    snapshot[id] = {
+      // Store the position as of now, not the base position of the last update, so a restart
+      // resumes (paused) where playback actually was.
+      state: { ...room.state, position: current.position, updatedAt: Date.now() },
+      messages: room.messages.slice(-80),
+      emptySince: room.members.size ? null : room.emptySince || Date.now()
+    };
+  }
+  const tmp = `${SYNC_STATE_FILE}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(snapshot));
+    fs.renameSync(tmp, SYNC_STATE_FILE);
+  } catch (error) {
+    console.warn(`[sync] failed to persist room state: ${error.message}`);
+  }
+}
+
+function persistRooms() {
+  if (!ROLES.has('sync') || roomStateFlushTimer) return;
+  roomStateFlushTimer = setTimeout(() => {
+    roomStateFlushTimer = null;
+    writeRoomsNow();
+  }, 1500);
+}
+
+function anyRoomPlaying() {
+  for (const room of rooms.values()) {
+    if (room.members.size && room.state.isPlaying) return true;
+  }
+  return false;
+}
+
+function restoreRooms() {
+  if (!ROLES.has('sync') || !fs.existsSync(SYNC_STATE_FILE)) return;
+  try {
+    const snapshot = JSON.parse(fs.readFileSync(SYNC_STATE_FILE, 'utf8'));
+    for (const [id, saved] of Object.entries(snapshot || {})) {
+      if (!id || !saved?.state) continue;
+      const room = roomFor(id);
+      room.state = {
+        ...room.state,
+        ...saved.state,
+        isPlaying: false,
+        position: Math.max(0, Number(saved.state.position) || 0),
+        updatedAt: Date.now(),
+        version: Number(saved.state.version || 0) + 1,
+        updatedBy: 'system'
+      };
+      room.state.mediaQueues = normalizeQueues(room.state.mediaQueues);
+      room.state.playbackModes = normalizePlaybackModes(room.state.playbackModes);
+      room.messages = Array.isArray(saved.messages) ? saved.messages.slice(-80) : [];
+      room.emptySince = Number(saved.emptySince) || Date.now();
+    }
+    console.log(`[sync] restored ${rooms.size} room(s) from ${SYNC_STATE_FILE}`);
+  } catch (error) {
+    console.warn(`[sync] ignoring unreadable ${SYNC_STATE_FILE}: ${error.message}`);
+  }
+}
+
+function pruneEmptyRooms() {
+  const cutoff = Date.now() - ROOM_EMPTY_TTL_MS;
+  let removed = 0;
+  for (const [id, room] of rooms) {
+    if (!room.members.size && Number(room.emptySince || 0) < cutoff) {
+      rooms.delete(id);
+      removed += 1;
+    }
+  }
+  if (removed) persistRooms();
 }
 
 function safeLyrics(input) {
@@ -570,14 +710,14 @@ function sanitizeTrack(input = {}, fallbackType = 'audio') {
     id: safeShortText(input.id, 80) || randomId('track'),
     mediaUrl,
     mediaType,
-    title: safeShortText(input.title || input.name || filenameFromUrl(mediaUrl) || (mediaType === 'audio' ? '未命名音乐' : '未命名视频'), 160),
-    artist: safeShortText(input.artist, 120),
-    album: safeShortText(input.album, 120),
-    coverUrl: safeShortText(input.coverUrl, 3000),
+    title: safeShortText(input.title || input.name || filenameFromUrl(mediaUrl) || (mediaType === 'audio' ? '未命名音乐' : '未命名视频'), TEXT_LIMITS.title),
+    artist: safeShortText(input.artist, TEXT_LIMITS.artist),
+    album: safeShortText(input.album, TEXT_LIMITS.album),
+    coverUrl: safeShortText(input.coverUrl, TEXT_LIMITS.coverUrl),
     duration: Number.isFinite(Number(input.duration)) ? Math.max(0, Number(input.duration)) : null,
     lyrics: safeLyrics(input.lyrics),
-    sourceName: safeShortText(input.sourceName || input.name, 180),
-    addedAt: input.addedAt || now()
+    sourceName: safeShortText(input.sourceName || input.name, TEXT_LIMITS.sourceName),
+    addedAt: now()
   };
 }
 
@@ -610,6 +750,8 @@ function setCurrentTrack(room, track, user, isPlaying = true) {
 
 function setRoomMode(room, user, mode) {
   const roomMode = safeMediaType(mode);
+  // Re-selecting the active mode must not rewind and pause the whole room.
+  if (room.state.roomMode === roomMode && room.state.mediaType === roomMode) return false;
   room.state.roomMode = roomMode;
   room.state.mediaType = roomMode;
   const track = currentTrack(room, roomMode) || queueFor(room, roomMode)[0] || null;
@@ -626,10 +768,12 @@ function setRoomMode(room, user, mode) {
     room.state.version = Number(room.state.version || 0) + 1;
     room.state.updatedBy = user?.username || 'system';
   }
+  return true;
 }
 
 function broadcastState(room, reason = 'control') {
   broadcast(room, { type: 'state', state: computedState(room), reason });
+  persistRooms();
 }
 
 function moveQueueItem(queue, id, direction) {
@@ -668,7 +812,7 @@ function handleQueueMessage(room, user, message) {
     const track = queue.find((item) => item.id === String(message.trackId || ''));
     if (!track || !message.patch || typeof message.patch !== 'object') return;
     for (const field of ['title', 'artist', 'album', 'coverUrl', 'sourceName']) {
-      if (field in message.patch) track[field] = safeShortText(message.patch[field], field === 'coverUrl' ? 3000 : 180);
+      if (field in message.patch) track[field] = safeShortText(message.patch[field], TEXT_LIMITS[field]);
     }
     if ('duration' in message.patch) track.duration = Number.isFinite(Number(message.patch.duration)) ? Math.max(0, Number(message.patch.duration)) : null;
     if ('lyrics' in message.patch) track.lyrics = safeLyrics(message.patch.lyrics);
@@ -737,6 +881,18 @@ function handleQueueMessage(room, user, message) {
     if (!queue.length) return;
     const currentIndex = queue.findIndex((track) => track.id === room.state.currentTrackId);
     if (message.ended) {
+      // Every member reports `ended` for the same track within a few ms of each other. Only the
+      // first report for the track that is actually current may advance the queue; the rest are
+      // duplicates and would otherwise skip tracks or re-trigger repeat-one.
+      const endedTrackId = safeShortText(message.trackId, 80);
+      if (endedTrackId && endedTrackId !== room.state.currentTrackId) return;
+      if (room.state.mediaType !== mediaType) return;
+      // A repeat-one loop keeps the same track current, so a second report for it inside the
+      // window is still a duplicate; legacy reports without a trackId rely on the window alone.
+      const sinceLastAdvance = Date.now() - Number(room.lastEndedAdvanceAt || 0);
+      if (sinceLastAdvance < ENDED_DEDUPE_WINDOW_MS && (!endedTrackId || endedTrackId === room.lastEndedTrackId)) return;
+      room.lastEndedAdvanceAt = Date.now();
+      room.lastEndedTrackId = endedTrackId || room.state.currentTrackId;
       const mode = playbackModeFor(room, mediaType);
       if (mode === 'repeat-one' && currentIndex >= 0) {
         setCurrentTrack(room, queue[currentIndex], user, true);
@@ -792,7 +948,9 @@ function roomFor(roomId) {
         updatedBy: ''
       },
       members: new Map(),
-      messages: []
+      messages: [],
+      emptySince: Date.now(),
+      lastEndedAdvanceAt: 0
     });
   }
   return rooms.get(roomId);
@@ -865,6 +1023,18 @@ function pauseRoomWhenEmpty(room) {
     version: current.version + 1,
     updatedBy: 'system'
   };
+  room.emptySince = Date.now();
+  persistRooms();
+}
+
+function takeChatToken(member) {
+  const nowMs = Date.now();
+  const elapsed = (nowMs - Number(member.chatRefillAt || nowMs)) / 1000;
+  member.chatTokens = Math.min(CHAT_BURST, Number(member.chatTokens ?? CHAT_BURST) + elapsed * CHAT_REFILL_PER_SECOND);
+  member.chatRefillAt = nowMs;
+  if (member.chatTokens < 1) return false;
+  member.chatTokens -= 1;
+  return true;
 }
 
 function applyState(room, user, incoming) {
@@ -932,9 +1102,16 @@ wss.on('connection', (ws, req, payload) => {
     userId: payload.userId,
     username: payload.username,
     joinedAt: now(),
+    chatTokens: CHAT_BURST,
+    chatRefillAt: Date.now(),
     ws
   };
   room.members.set(connectionId, member);
+  room.emptySince = null;
+  ws.isAlive = true;
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
 
   send(ws, {
     type: 'snapshot',
@@ -957,8 +1134,7 @@ wss.on('connection', (ws, req, payload) => {
       return;
     }
     if (message.type === 'room_mode') {
-      setRoomMode(room, member, message.roomMode || message.mediaType);
-      broadcastState(room, 'room_mode');
+      if (setRoomMode(room, member, message.roomMode || message.mediaType)) broadcastState(room, 'room_mode');
       return;
     }
     if (/^queue_/.test(message.type || '')) {
@@ -968,6 +1144,10 @@ wss.on('connection', (ws, req, payload) => {
     if (message.type === 'chat') {
       const text = String(message.text || '').trim().slice(0, 300);
       if (!text) return;
+      if (!takeChatToken(member)) {
+        send(ws, { type: 'notice', level: 'warn', text: '发言太快了，稍等一下。' });
+        return;
+      }
       const chat = {
         id: crypto.randomBytes(10).toString('hex'),
         userId: member.userId,
@@ -977,8 +1157,9 @@ wss.on('connection', (ws, req, payload) => {
       };
       room.messages.push(chat);
       room.messages = room.messages.slice(-160);
+      // One message drives both the chat list and the danmaku layer on the client.
       broadcast(room, { type: 'chat', message: chat });
-      broadcast(room, { type: 'danmaku', message: chat });
+      persistRooms();
       return;
     }
     if (message.type === 'request_sync') {
@@ -1012,8 +1193,48 @@ setInterval(() => {
   }
 }, 1000);
 
+// Heartbeat: a member whose socket silently died (mobile sleep, NAT timeout) is dropped within
+// two intervals instead of lingering in the member list until the TCP stack gives up.
+setInterval(() => {
+  for (const client of wss.clients) {
+    if (client.isAlive === false) {
+      client.terminate();
+      continue;
+    }
+    client.isAlive = false;
+    try {
+      client.ping();
+    } catch {
+      client.terminate();
+    }
+  }
+}, WS_HEARTBEAT_MS).unref();
+
+setInterval(pruneEmptyRooms, 10 * 60 * 1000).unref();
+setInterval(pruneUploadTmpFiles, 6 * 60 * 60 * 1000).unref();
+// While something is playing the live position moves without any state change, so checkpoint it
+// regularly; a graceful stop (systemd restart, node update) flushes synchronously.
+setInterval(() => {
+  if (anyRoomPlaying()) writeRoomsNow();
+}, 10 * 1000).unref();
+for (const signal of ['SIGTERM', 'SIGINT']) {
+  process.on(signal, () => {
+    clearTimeout(roomStateFlushTimer);
+    roomStateFlushTimer = null;
+    writeRoomsNow();
+    process.exit(0);
+  });
+}
+pruneUploadTmpFiles();
+restoreRooms();
+
 app.use((err, req, res, next) => {
+  if (req.file) discardUpload(req.file);
   if (res.headersSent) return next(err);
+  if (err instanceof multer.MulterError) {
+    const message = err.code === 'LIMIT_FILE_SIZE' ? `文件超过上传上限 ${MAX_UPLOAD_MB} MB。` : `上传失败：${err.message}`;
+    return res.status(413).json({ error: message });
+  }
   res.status(err.status || 500).json({ error: err.message || '节点错误。' });
 });
 

@@ -21,8 +21,10 @@ const DATA_DIR = path.join(ROOT, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const SECRET_FILE = path.join(DATA_DIR, 'secrets.json');
 const MEDIA_COVER_DIR = path.join(DATA_DIR, 'media-covers');
+const SESSION_FILE = path.join(DATA_DIR, 'sessions.json');
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const STORAGE_ROOT = process.env.VIDEO_STORAGE_ROOT || '/video52000/videos';
+const UPLOAD_TMP_DIR = path.join(STORAGE_ROOT, '.uploads-tmp');
 const PORT = Number(process.env.PORT || 51999);
 const DEFAULT_SYNC_PORT = Number(process.env.DEFAULT_SYNC_PORT || 52000);
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 2048);
@@ -34,10 +36,17 @@ const DEFAULT_ADMIN_DISPLAY_NAME = String(process.env.DEFAULT_ADMIN_DISPLAY_NAME
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(MEDIA_COVER_DIR, { recursive: true });
 fs.mkdirSync(STORAGE_ROOT, { recursive: true });
+fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
 
+// Uploads stream to a temp directory inside the storage root so the final move is a rename,
+// instead of buffering multi-GB files in memory. `defParamCharset` keeps UTF-8 filenames intact.
 const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024 }
+  storage: multer.diskStorage({
+    destination: UPLOAD_TMP_DIR,
+    filename: (req, file, cb) => cb(null, randomId('upload'))
+  }),
+  defParamCharset: 'utf8',
+  limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024, files: 1 }
 });
 const localDownloadTasks = new Map();
 const MEDIA_METADATA_FETCH_LIMIT = 8 * 1024 * 1024;
@@ -45,9 +54,20 @@ const MEDIA_LRC_FETCH_LIMIT = 256 * 1024;
 const MEDIA_LYRICS_TEXT_LIMIT = 30000;
 const MEDIA_LYRICS_LINE_LIMIT = 600;
 const MEDIA_COVER_TTL_MS = 30 * 60 * 1000;
+const MEDIA_COVER_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const MEDIA_COVER_TOUCH_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const MEDIA_NETEASE_LYRIC_TTL_MS = 30 * 60 * 1000;
+const MEDIA_METADATA_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const MEDIA_METADATA_FALLBACK_TTL_MS = 2 * 60 * 1000;
+const MEDIA_METADATA_CACHE_MAX = 600;
+const UPLOAD_TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_PER_USER = 10;
+const LOGIN_MAX_PER_IP = 60;
 const mediaCoverCache = new Map();
 const neteaseLyricsCache = new Map();
+const mediaMetadataCache = new Map();
+const loginAttempts = new Map();
 let musicMetadataImport = null;
 
 function randomId(prefix) {
@@ -63,10 +83,168 @@ function readJson(file, fallback) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
-function writeJson(file, value) {
+function writeJson(file, value, mode) {
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), mode ? { mode } : undefined);
   fs.renameSync(tmp, file);
+}
+
+// Sessions survive restarts by living in data/sessions.json (debounced writes, expired entries pruned).
+class JsonSessionStore extends session.Store {
+  constructor(file) {
+    super();
+    this.file = file;
+    this.sessions = new Map();
+    this.flushTimer = null;
+    const nowMs = Date.now();
+    try {
+      for (const [sid, entry] of Object.entries(readJson(file, {}) || {})) {
+        if (entry?.data && Number(entry.expiresAt) > nowMs) this.sessions.set(sid, entry);
+      }
+    } catch (error) {
+      console.warn(`[session] ignoring unreadable ${file}: ${error.message}`);
+    }
+    setInterval(() => this.prune(), 15 * 60 * 1000).unref();
+  }
+
+  expiresAtFor(sess) {
+    const expires = sess?.cookie?.expires ? new Date(sess.cookie.expires).getTime() : 0;
+    return Number.isFinite(expires) && expires > 0 ? expires : Date.now() + 30 * 24 * 60 * 60 * 1000;
+  }
+
+  scheduleFlush() {
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      try {
+        writeJson(this.file, Object.fromEntries(this.sessions), 0o600);
+      } catch (error) {
+        console.warn(`[session] flush failed: ${error.message}`);
+      }
+    }, 400);
+  }
+
+  prune() {
+    const nowMs = Date.now();
+    let changed = false;
+    for (const [sid, entry] of this.sessions) {
+      if (Number(entry.expiresAt) <= nowMs) {
+        this.sessions.delete(sid);
+        changed = true;
+      }
+    }
+    if (changed) this.scheduleFlush();
+  }
+
+  get(sid, callback) {
+    const entry = this.sessions.get(sid);
+    if (!entry || Number(entry.expiresAt) <= Date.now()) {
+      this.sessions.delete(sid);
+      return callback(null, null);
+    }
+    callback(null, JSON.parse(JSON.stringify(entry.data)));
+  }
+
+  set(sid, sess, callback) {
+    this.sessions.set(sid, { data: JSON.parse(JSON.stringify(sess)), expiresAt: this.expiresAtFor(sess) });
+    this.scheduleFlush();
+    callback?.(null);
+  }
+
+  touch(sid, sess, callback) {
+    const entry = this.sessions.get(sid);
+    if (entry) {
+      entry.expiresAt = this.expiresAtFor(sess);
+      entry.data.cookie = JSON.parse(JSON.stringify(sess.cookie || entry.data.cookie || {}));
+      this.scheduleFlush();
+    }
+    callback?.(null);
+  }
+
+  destroy(sid, callback) {
+    this.sessions.delete(sid);
+    this.scheduleFlush();
+    callback?.(null);
+  }
+}
+
+function pruneLoginAttempts() {
+  const nowMs = Date.now();
+  for (const [key, entry] of loginAttempts) {
+    if (entry.resetAt <= nowMs) loginAttempts.delete(key);
+  }
+}
+
+function loginAttemptKeys(req, username) {
+  return [
+    { key: `user:${String(username || '').toLowerCase()}`, limit: LOGIN_MAX_PER_USER },
+    { key: `ip:${req.ip || 'unknown'}`, limit: LOGIN_MAX_PER_IP }
+  ];
+}
+
+function assertLoginAllowed(req, username) {
+  pruneLoginAttempts();
+  for (const { key, limit } of loginAttemptKeys(req, username)) {
+    const entry = loginAttempts.get(key);
+    if (entry && entry.count >= limit) {
+      const minutes = Math.max(1, Math.ceil((entry.resetAt - Date.now()) / 60000));
+      throw Object.assign(new Error(`登录尝试过于频繁，请 ${minutes} 分钟后再试。`), { status: 429 });
+    }
+  }
+}
+
+function recordLoginFailure(req, username) {
+  for (const { key } of loginAttemptKeys(req, username)) {
+    const entry = loginAttempts.get(key);
+    if (entry && entry.resetAt > Date.now()) entry.count += 1;
+    else loginAttempts.set(key, { count: 1, resetAt: Date.now() + LOGIN_WINDOW_MS });
+  }
+}
+
+function clearLoginFailures(req, username) {
+  for (const { key } of loginAttemptKeys(req, username)) loginAttempts.delete(key);
+}
+
+async function moveFile(from, to) {
+  try {
+    await fs.promises.rename(from, to);
+  } catch (error) {
+    if (error.code !== 'EXDEV') throw error;
+    await fs.promises.copyFile(from, to);
+    await fs.promises.unlink(from);
+  }
+}
+
+async function discardUpload(file) {
+  if (file?.path) await fs.promises.unlink(file.path).catch(() => {});
+}
+
+async function pruneDirectoryByAge(dir, maxAgeMs) {
+  const names = await fs.promises.readdir(dir).catch(() => []);
+  const cutoff = Date.now() - maxAgeMs;
+  for (const name of names) {
+    const file = path.join(dir, name);
+    const stat = await fs.promises.stat(file).catch(() => null);
+    if (stat?.isFile() && stat.mtimeMs < cutoff) await fs.promises.unlink(file).catch(() => {});
+  }
+}
+
+function pruneMediaCoverFiles() {
+  return pruneDirectoryByAge(MEDIA_COVER_DIR, MEDIA_COVER_MAX_AGE_MS);
+}
+
+function pruneUploadTmpFiles() {
+  return pruneDirectoryByAge(UPLOAD_TMP_DIR, UPLOAD_TMP_MAX_AGE_MS);
+}
+
+function touchFileIfStale(file, intervalMs = MEDIA_COVER_TOUCH_INTERVAL_MS) {
+  fs.promises.stat(file).then((stat) => {
+    if (Date.now() - stat.mtimeMs > intervalMs) {
+      const stamp = new Date();
+      return fs.promises.utimes(file, stamp, stamp);
+    }
+    return null;
+  }).catch(() => {});
 }
 
 function loadSecrets() {
@@ -633,6 +811,7 @@ function storeMediaCover(picture) {
   const file = path.join(MEDIA_COVER_DIR, id);
   try {
     if (!fs.existsSync(file)) fs.writeFileSync(file, data);
+    else touchFileIfStale(file);
   } catch {
     return '';
   }
@@ -854,7 +1033,7 @@ function lrcUrlForMediaUrl(sourceUrl) {
 
 async function fetchLimitedText(urlString, limit = MEDIA_LRC_FETCH_LIMIT, redirects = 0) {
   if (redirects > 3) return '';
-  const safeUrl = await assertPublicHttpUrl(urlString);
+  const safeUrl = await assertPublicHttpUrl(urlString, isTrustedStorageUrl(urlString));
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 7000);
   try {
@@ -929,7 +1108,24 @@ function isPrivateIpAddress(address) {
     || (a === 100 && b >= 64 && b <= 127);
 }
 
-async function assertPublicHttpUrl(urlString) {
+// Storage nodes configured by an admin may legitimately live on LAN addresses; the private-IP
+// guard exists for arbitrary user-supplied URLs, so URLs under a known node base are trusted.
+function isTrustedStorageUrl(urlString) {
+  const value = String(urlString || '').trim().toLowerCase();
+  if (!value) return false;
+  return db.storageNodes.some((node) => {
+    if (!node.enabled || !node.url) return false;
+    let base = '';
+    try {
+      base = normalizeBaseUrl(node.url).toLowerCase();
+    } catch {
+      return false;
+    }
+    return Boolean(base) && (value === base || value.startsWith(`${base}/`));
+  });
+}
+
+async function assertPublicHttpUrl(urlString, allowPrivate = false) {
   let parsed;
   try {
     parsed = new URL(urlString);
@@ -939,6 +1135,7 @@ async function assertPublicHttpUrl(urlString) {
   if (!['http:', 'https:'].includes(parsed.protocol)) {
     throw Object.assign(new Error('音频地址必须是 http(s)。'), { status: 400 });
   }
+  if (allowPrivate) return parsed.toString();
   const hostname = parsed.hostname.toLowerCase();
   if (!hostname || hostname === 'localhost' || hostname.endsWith('.localhost')) {
     throw Object.assign(new Error('音频地址不能指向本机。'), { status: 400 });
@@ -952,7 +1149,7 @@ async function assertPublicHttpUrl(urlString) {
 
 async function fetchLimitedMediaBuffer(urlString, redirects = 0) {
   if (redirects > 3) throw Object.assign(new Error('音频地址跳转过多。'), { status: 400 });
-  const safeUrl = await assertPublicHttpUrl(urlString);
+  const safeUrl = await assertPublicHttpUrl(urlString, isTrustedStorageUrl(urlString));
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 9000);
   try {
@@ -1001,22 +1198,62 @@ function localVideoFileFromUrl(req, value) {
   return rel ? fullStoragePath(STORAGE_ROOT, rel) : null;
 }
 
+function readMetadataCache(key) {
+  const entry = mediaMetadataCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    mediaMetadataCache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function writeMetadataCache(key, value, ttl) {
+  mediaMetadataCache.delete(key);
+  mediaMetadataCache.set(key, { value, expiresAt: Date.now() + ttl });
+  while (mediaMetadataCache.size > MEDIA_METADATA_CACHE_MAX) {
+    const oldest = mediaMetadataCache.keys().next().value;
+    if (oldest === undefined) break;
+    mediaMetadataCache.delete(oldest);
+  }
+}
+
+function isFallbackMetadata(value) {
+  return Boolean(value) && !value.artist && !value.album && !value.coverUrl && !value.lyrics && value.duration === null;
+}
+
+// Metadata parsing is the expensive part of a directory listing (each audio card asks for it),
+// so results are cached per file identity: local files by size + mtime, remote files by URL.
 async function readMediaMetadata(req, sourceUrl, sourceName) {
   const fallback = fallbackMediaMetadata(sourceName || filenameFromUrl(sourceUrl));
+  let cacheKey = '';
   try {
     const metadata = await loadMusicMetadata();
     const localFile = localVideoFileFromUrl(req, sourceUrl);
-    if (localFile && fs.existsSync(localFile) && fs.statSync(localFile).isFile()) {
+    const localStat = localFile ? await fs.promises.stat(localFile).catch(() => null) : null;
+    if (localStat?.isFile()) {
+      cacheKey = `local:${localFile}:${localStat.size}:${Math.round(localStat.mtimeMs)}`;
+    } else {
+      cacheKey = `remote:${String(sourceUrl || '').trim()}`;
+    }
+    const cached = readMetadataCache(cacheKey);
+    if (cached) return { ...cached, sourceName: cached.sourceName || fallback.sourceName };
+    let result;
+    if (localStat?.isFile()) {
       const parsed = await metadata.parseFile(localFile, { duration: true, skipCovers: false });
       const lyrics = normalizeLyricsList(parsed?.common?.lyrics, 'embedded') || await readLocalLrc(localFile) || await neteaseLyricsFromParsed(parsed);
-      return publicMetadataFromParsed(parsed, sourceName || localFile, lyrics);
+      result = publicMetadataFromParsed(parsed, sourceName || localFile, lyrics);
+    } else {
+      const remote = await fetchLimitedMediaBuffer(sourceUrl);
+      if (!remote.buffer.length) throw new Error('empty');
+      const parsed = await metadata.parseBuffer(remote.buffer, remote.contentType, { duration: true, skipCovers: false });
+      const lyrics = normalizeLyricsList(parsed?.common?.lyrics, 'embedded') || await readRemoteLrc(sourceUrl) || await neteaseLyricsFromParsed(parsed);
+      result = publicMetadataFromParsed(parsed, sourceName || filenameFromUrl(sourceUrl), lyrics);
     }
-    const remote = await fetchLimitedMediaBuffer(sourceUrl);
-    if (!remote.buffer.length) return fallback;
-    const parsed = await metadata.parseBuffer(remote.buffer, remote.contentType, { duration: true, skipCovers: false });
-    const lyrics = normalizeLyricsList(parsed?.common?.lyrics, 'embedded') || await readRemoteLrc(sourceUrl) || await neteaseLyricsFromParsed(parsed);
-    return publicMetadataFromParsed(parsed, sourceName || filenameFromUrl(sourceUrl), lyrics);
+    writeMetadataCache(cacheKey, result, isFallbackMetadata(result) ? MEDIA_METADATA_FALLBACK_TTL_MS : MEDIA_METADATA_CACHE_TTL_MS);
+    return result;
   } catch {
+    if (cacheKey) writeMetadataCache(cacheKey, fallback, MEDIA_METADATA_FALLBACK_TTL_MS);
     return fallback;
   }
 }
@@ -1238,14 +1475,29 @@ function createLocalDownloadTask(node, body) {
   return publicDownloadTask(task);
 }
 
-function listLocalStorage(req, node, rel) {
+function isHiddenEntry(name) {
+  return String(name || '').startsWith('.');
+}
+
+// Listing is read-only: a missing directory is a 404, never created as a side effect of a GET.
+async function listLocalStorage(req, node, rel) {
   const root = node.path || STORAGE_ROOT;
   const safeRel = cleanRelativePath(rel);
   const dir = fullStoragePath(root, safeRel);
-  fs.mkdirSync(dir, { recursive: true });
-  const entries = fs.readdirSync(dir, { withFileTypes: true }).map((entry) => {
+  let dirents;
+  try {
+    dirents = await fs.promises.readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') {
+      throw Object.assign(new Error('目录不存在。'), { status: 404 });
+    }
+    throw error;
+  }
+  const entries = (await Promise.all(dirents.map(async (entry) => {
+    if (isHiddenEntry(entry.name) || (!entry.isFile() && !entry.isDirectory())) return null;
+    const stat = await fs.promises.stat(path.join(dir, entry.name)).catch(() => null);
+    if (!stat) return null;
     const childRel = cleanRelativePath(path.posix.join(safeRel, entry.name));
-    const stat = fs.statSync(path.join(dir, entry.name));
     const mediaType = entry.isFile() ? mediaTypeForFile(entry.name) : '';
     const mediaUrl = entry.isFile() ? publicVideoUrl(req, node, childRel) : null;
     return {
@@ -1261,7 +1513,7 @@ function listLocalStorage(req, node, rel) {
       mediaUrl,
       videoUrl: mediaUrl
     };
-  });
+  }))).filter(Boolean);
   entries.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
   return { path: safeRel, entries };
 }
@@ -1284,13 +1536,21 @@ async function fetchRemoteJson(node, endpoint, options = {}) {
       const compact = text.replace(/\s+/g, ' ').trim().slice(0, 200);
       throw Object.assign(
         new Error(`远程节点返回了非 JSON 内容，可能节点地址没有指向 storage API 或反代返回了 HTML。HTTP ${response.status}: ${compact || response.statusText}`),
-        { status: response.status || 502 }
+        { status: response.status || 502, expose: true }
       );
     }
     if (!response.ok) {
-      throw Object.assign(new Error(body.error || `远程节点返回 HTTP ${response.status}`), { status: response.status });
+      throw Object.assign(new Error(body.error || `远程节点返回 HTTP ${response.status}`), { status: response.status, expose: true });
     }
     return body;
+  } catch (error) {
+    if (error.name === 'AbortError' || /aborted/i.test(String(error.message))) {
+      throw Object.assign(new Error(`远程节点 ${normalizeBaseUrl(node.url)} 响应超时。`), { status: 504, expose: true });
+    }
+    if (!error.status) {
+      throw Object.assign(new Error(`无法连接远程节点 ${normalizeBaseUrl(node.url)}：${error.cause?.code || error.message}`), { status: 502, expose: true });
+    }
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
@@ -2588,8 +2848,10 @@ app.use(express.urlencoded({ extended: true }));
 app.use(session({
   name: 'video_together_sid',
   secret: secrets.sessionSecret,
+  store: new JsonSessionStore(SESSION_FILE),
   resave: false,
   saveUninitialized: false,
+  rolling: true,
   cookie: {
     httpOnly: true,
     sameSite: 'lax',
@@ -2636,11 +2898,14 @@ app.post('/api/auth/register', asyncRoute(async (req, res) => {
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const username = String(req.body.username || '').trim();
   const password = String(req.body.password || '');
+  assertLoginAllowed(req, username);
   const user = db.users.find((item) => item.username.toLowerCase() === username.toLowerCase());
   if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+    recordLoginFailure(req, username);
     return res.status(401).json({ error: '用户名或密码错误。' });
   }
   if (user.disabled) return res.status(403).json({ error: '此用户已被禁用。' });
+  clearLoginFailures(req, username);
   req.session.userId = user.id;
   res.json({ user: publicUser(user) });
 }));
@@ -2741,8 +3006,9 @@ app.get('/api/media/covers/:id', requireAuth, (req, res) => {
     return res.send(cover.data);
   }
   if (!id || !fs.existsSync(file) || !fs.statSync(file).isFile()) return res.status(404).end();
+  touchFileIfStale(file);
   res.setHeader('content-type', mediaCoverMimeFromName(id));
-  res.setHeader('cache-control', 'private, max-age=1800');
+  res.setHeader('cache-control', 'private, max-age=86400');
   res.sendFile(file);
 });
 
@@ -2904,22 +3170,34 @@ app.post('/api/admin/storage/nodes/:id/mkdir', requireAuth, requireAdmin, asyncR
 }));
 
 app.post('/api/admin/storage/nodes/:id/upload', requireAuth, requireAdmin, upload.single('file'), asyncRoute(async (req, res) => {
-  const node = db.storageNodes.find((item) => item.id === req.params.id);
-  if (!node) return res.status(404).json({ error: '存储节点不存在。' });
-  if (!req.file) return res.status(400).json({ error: '请选择文件。' });
-  const dirRel = cleanRelativePath(req.body.path || '');
-  const filename = path.basename(req.file.originalname || 'video.bin');
-  if ((node.type || 'remote') === 'local') {
-    const dir = fullStoragePath(node.path || STORAGE_ROOT, dirRel);
-    fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, filename), req.file.buffer);
-    return res.json({ ok: true, path: cleanRelativePath(path.posix.join(dirRel, filename)) });
+  try {
+    const node = db.storageNodes.find((item) => item.id === req.params.id);
+    if (!node) return res.status(404).json({ error: '存储节点不存在。' });
+    if (!req.file) return res.status(400).json({ error: '请选择文件。' });
+    const dirRel = cleanRelativePath(req.body.path || '');
+    const filename = safeFilename(req.file.originalname, 'video.bin');
+    const targetRel = cleanRelativePath(path.posix.join(dirRel, filename));
+    if ((node.type || 'remote') === 'local') {
+      const dir = fullStoragePath(node.path || STORAGE_ROOT, dirRel);
+      await fs.promises.mkdir(dir, { recursive: true });
+      await moveFile(req.file.path, fullStoragePath(node.path || STORAGE_ROOT, targetRel));
+      return res.json({ ok: true, path: targetRel });
+    }
+    // The temp file is handed to fetch as a file-backed Blob, so it streams to the node without
+    // being read into memory.
+    const form = new FormData();
+    form.append('path', dirRel);
+    form.append('file', await fs.openAsBlob(req.file.path, { type: req.file.mimetype || 'application/octet-stream' }), filename);
+    const result = await fetchRemoteJson(node, '/storage/upload', {
+      method: 'POST',
+      body: form,
+      headers: {},
+      timeout: 6 * 60 * 60 * 1000
+    });
+    res.json({ ok: true, path: result.path || targetRel });
+  } finally {
+    await discardUpload(req.file);
   }
-  const form = new FormData();
-  form.append('path', dirRel);
-  form.append('file', new Blob([req.file.buffer], { type: req.file.mimetype }), filename);
-  await fetchRemoteJson(node, '/storage/upload', { method: 'POST', body: form, headers: {} });
-  res.json({ ok: true });
 }));
 
 app.delete('/api/admin/storage/nodes/:id/item', requireAuth, requireAdmin, asyncRoute(async (req, res) => {
@@ -3320,10 +3598,26 @@ app.get(/.*/, (req, res) => {
 });
 
 app.use((err, req, res, next) => {
+  if (req.file) discardUpload(req.file);
   if (res.headersSent) return next(err);
-  const status = err.status || err.statusCode || 500;
-  res.status(status).json({ error: err.message || '服务器错误。' });
+  if (err instanceof multer.MulterError) {
+    const message = err.code === 'LIMIT_FILE_SIZE' ? `文件超过上传上限 ${MAX_UPLOAD_MB} MB。` : `上传失败：${err.message}`;
+    return res.status(413).json({ error: message });
+  }
+  const status = Number(err.status || err.statusCode || 500);
+  if (status >= 500 && !err.expose) {
+    console.error(`[api] ${req.method} ${req.originalUrl} failed:`, err);
+    return res.status(status).json({ error: '服务器内部错误，请稍后重试。' });
+  }
+  res.status(status).json({ error: err.message || '请求失败。' });
 });
+
+pruneUploadTmpFiles();
+pruneMediaCoverFiles();
+setInterval(() => {
+  pruneUploadTmpFiles();
+  pruneMediaCoverFiles();
+}, 6 * 60 * 60 * 1000).unref();
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Video Together app listening on http://127.0.0.1:${PORT}`);

@@ -2,7 +2,16 @@ const $ = (selector) => document.querySelector(selector);
 
 const LOCAL_SEEK_LOCK_MS = 7000;
 const LOCAL_SEEK_COMMIT_LOCK_MS = 6500;
-const PROGRESS_SYNC_THRESHOLD_SECONDS = 5;
+// Drift policy: under SOFT the player counts as in sync; between SOFT and HARD the playback rate is
+// nudged so members converge without a visible jump; above HARD we seek to the room position.
+const SOFT_SYNC_THRESHOLD_SECONDS = 0.4;
+const NUDGE_RELEASE_THRESHOLD_SECONDS = 0.15;
+const PROGRESS_SYNC_THRESHOLD_SECONDS = 3;
+const NUDGE_RATE_MAX_DELTA = 0.2;
+const RECONNECT_MAX_DELAY_MS = 15000;
+const SYNC_NOTICE_MS = 3200;
+const CHAT_DOM_LIMIT = 200;
+const DANMAKU_DOM_LIMIT = 40;
 
 const state = {
   mode: 'login',
@@ -63,6 +72,21 @@ const state = {
   musicMetadataNoCover: new Set(),
   musicCoverFailures: new Set(),
   mediaThumbCache: new Map(),
+  thumbObserver: null,
+  seenDanmaku: new Set(),
+  membersKey: '',
+  roomsKey: '',
+  sync: {
+    connection: 'idle',
+    mode: 'idle',
+    modeDetail: '',
+    latencyMs: null,
+    drift: 0,
+    nudgeRate: 1,
+    clockOffset: 0,
+    clockSamples: [],
+    noticeTimer: null
+  },
   storagePath: '',
   adminStoragePath: '',
   admin: {
@@ -153,30 +177,215 @@ function statusClass(kind) {
   return `status-pill status-${kind || 'muted'}`;
 }
 
-function setSyncStatus(text, kind) {
-  const el = $('#syncStatus');
-  el.textContent = text;
-  el.className = statusClass(kind);
+// ---- Sync bar -------------------------------------------------------------------------------
+// One indicator answers three questions at a glance: am I connected, am I in step with the room,
+// and who last changed something. Everything else the old status pills said is folded into a
+// short vocabulary of modes so the bar never turns into a log.
+const SYNC_CONNECTION_LABELS = {
+  idle: '未连接',
+  connecting: '连接中',
+  reconnecting: '重连中',
+  failed: '连接失败',
+  offline: '已断开'
+};
+
+const SYNC_MODE_LABELS = {
+  idle: '已连接',
+  loading: '加载中',
+  synced: '已同步',
+  nudging: '微调中',
+  catching: '追赶中',
+  buffering: '缓冲中',
+  seeking: '定位中',
+  paused: '已暂停',
+  ready: '就绪',
+  error: '播放失败'
+};
+
+const SYNC_MODE_TONES = {
+  idle: 'muted',
+  synced: 'good',
+  nudging: 'good',
+  ready: 'good',
+  paused: 'muted',
+  error: 'bad'
+};
+
+function selfName() {
+  return state.user?.displayName || state.user?.username || '';
 }
 
-function setLatencyStatus(ms) {
-  const el = $('#syncLatency');
+function setSyncConnection(connection) {
+  state.sync.connection = connection;
+  if (connection !== 'online') state.sync.latencyMs = null;
+  renderSyncBar();
+}
+
+function setSyncMode(mode, detail = '') {
+  state.sync.mode = mode;
+  state.sync.modeDetail = detail;
+  renderSyncBar();
+}
+
+function setSyncLatency(ms) {
+  state.sync.latencyMs = Number.isFinite(ms) ? Math.round(ms) : null;
+  renderSyncBar();
+}
+
+// Resting mode derived from the player itself; transient modes (loading, seeking, buffering,
+// error, ready) are set explicitly by the code paths that know about them.
+function settleSyncMode() {
+  const media = getMedia();
+  const current = state.sync.mode;
+  let mode;
+  if (!state.currentMediaUrl) mode = 'idle';
+  else if (state.sourceLoading) mode = 'loading';
+  else if (state.bufferingLocally) mode = current === 'buffering' ? 'buffering' : 'catching';
+  else if (hasLocalSeekIntent() || media?.seeking) mode = 'seeking';
+  else if (!media || media.paused) mode = current === 'error' || current === 'ready' ? current : 'paused';
+  else mode = state.sync.nudgeRate !== 1 ? 'nudging' : 'synced';
+  if (mode !== current) setSyncMode(mode);
+  else renderSyncBar();
+}
+
+function syncActionVerb(reason, remote, mediaChanged) {
+  const title = remote?.mediaMeta?.title || currentTrackFromQueue(remote?.mediaType)?.title || fileTitleFromUrl(remote?.mediaUrl || '');
+  if (reason === 'room_mode') return remote?.roomMode === 'audio' ? '切换到音乐' : '切换到视频';
+  if (/^queue_(play|next|previous|random|loop)$/.test(reason) || (mediaChanged && /^queue_/.test(reason))) {
+    return title ? `播放《${title}》` : '切换了媒体';
+  }
+  if (reason === 'queue_end') return '播完了队列';
+  if (reason === 'play') return '开始播放';
+  if (reason === 'pause') return '暂停了';
+  if (reason === 'seek') return `跳到 ${formatClock(remote?.position || 0)}`;
+  if (reason === 'sync') return '对齐了进度';
+  return '';
+}
+
+function noteRemoteAction(remote, reason, mediaChanged = false) {
+  const actor = remote?.updatedBy || '';
+  if (!actor || actor === 'system' || actor === selfName()) return;
+  const verb = syncActionVerb(reason, remote, mediaChanged);
+  if (verb) showSyncNotice(`${actor} ${verb}`);
+}
+
+function showSyncNotice(text) {
+  const el = $('#syncNotice');
   if (!el) return;
-  if (!Number.isFinite(ms)) {
-    el.textContent = '同步延迟 -';
-    el.className = statusClass('muted');
+  el.textContent = text;
+  el.classList.add('is-visible');
+  clearTimeout(state.sync.noticeTimer);
+  state.sync.noticeTimer = setTimeout(() => el.classList.remove('is-visible'), SYNC_NOTICE_MS);
+}
+
+function renderSyncBar() {
+  const bar = $('#syncBar');
+  if (!bar) return;
+  const sync = state.sync;
+  const online = sync.connection === 'online';
+  const hasMedia = Boolean(state.currentMediaUrl);
+  let label;
+  let tone;
+  if (!online) {
+    label = SYNC_CONNECTION_LABELS[sync.connection] || '未连接';
+    tone = sync.connection === 'failed' ? 'bad' : sync.connection === 'idle' || sync.connection === 'offline' ? 'muted' : 'warn';
+  } else {
+    const mode = hasMedia ? sync.mode : 'idle';
+    label = SYNC_MODE_LABELS[mode] || '已同步';
+    tone = SYNC_MODE_TONES[mode] || 'warn';
+  }
+  const details = [];
+  if (online && Number.isFinite(sync.latencyMs)) details.push(`${sync.latencyMs}ms`);
+  if (online && hasMedia && state.desiredPlaying && Math.abs(sync.drift) >= SOFT_SYNC_THRESHOLD_SECONDS) {
+    details.push(sync.drift > 0 ? `落后 ${sync.drift.toFixed(1)}s` : `领先 ${Math.abs(sync.drift).toFixed(1)}s`);
+  }
+  if (sync.modeDetail) details.push(sync.modeDetail);
+  bar.dataset.connection = sync.connection;
+  bar.dataset.mode = hasMedia ? sync.mode : 'idle';
+  bar.dataset.tone = tone;
+  setText('#syncLabel', label);
+  setText('#syncDetail', details.join(' · '));
+  const button = $('#syncNowBtn');
+  if (button) {
+    const needsReconnect = ['failed', 'offline', 'reconnecting'].includes(sync.connection);
+    const outOfSync = online && hasMedia && (
+      ['catching', 'buffering', 'error', 'ready'].includes(sync.mode)
+      || (state.desiredPlaying && Math.abs(sync.drift) >= PROGRESS_SYNC_THRESHOLD_SECONDS)
+    );
+    button.textContent = needsReconnect ? '重连' : '同步';
+    button.classList.toggle('is-attention', needsReconnect || outOfSync);
+    button.disabled = sync.connection === 'connecting' || (online && !hasMedia);
+  }
+}
+
+// Align this player to the room: drop every local intent lock, seek to the room position and
+// mirror the room's play/pause state. Purely local, nothing is broadcast.
+function alignToRoom() {
+  const remote = state.latestRemoteState;
+  if (!remote || !state.currentMediaUrl) return false;
+  state.explicitPauseUntil = 0;
+  state.localPlayUntil = 0;
+  state.localSeekUntil = 0;
+  state.seekIntentUntil = 0;
+  state.pendingLocalSeekTarget = null;
+  state.lastSeekTarget = null;
+  state.lastCatchupSeekAt = 0;
+  clearTimeout(state.seekCommitTimer);
+  clearTimeout(state.pendingPauseTimer);
+  state.desiredPlaying = Boolean(remote.isPlaying);
+  const target = remoteTargetPosition(remote);
+  if (state.sourceLoading) {
+    setPendingSeek(target);
+    state.pendingAutoplay = Boolean(remote.isPlaying);
+    return true;
+  }
+  suppressLocalMediaEvents(1500);
+  seekMediaTo(target, 1200);
+  if (remote.isPlaying) {
+    markLocalPlay();
+    playMedia().then(() => {
+      state.sync.drift = 0;
+      settleSyncMode();
+    }).catch(() => setSyncMode('ready', '点击播放'));
+  } else {
+    pauseMedia();
+    settleSyncMode();
+  }
+  renderPlaybackControls();
+  return true;
+}
+
+// The one explicit "同步" action a member has. Doubles as reconnect when the socket is down.
+function syncNow() {
+  const button = $('#syncNowBtn');
+  if (state.sync.connection !== 'online') {
+    if (!state.roomSession) return toast('请先进入房间');
+    triggerButtonFeedback(button, 'play');
+    state.reconnectAttempts = 0;
+    clearTimeout(state.reconnectTimer);
+    openRoomSocket(state.roomSession);
     return;
   }
-  const rounded = Math.round(ms);
-  el.textContent = `同步延迟 ${rounded}ms`;
-  el.className = statusClass(rounded < 120 ? 'good' : rounded < 320 ? 'warn' : 'bad');
+  triggerButtonFeedback(button, 'play');
+  if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify({ type: 'request_sync' }));
+  if (alignToRoom()) showSyncNotice('已对齐到房间进度');
 }
 
-function setBufferStatus(text = '缓冲状态 -', kind = 'muted') {
-  const el = $('#bufferStatus');
+function renderNowPlayingLine() {
+  const el = $('#nowPlayingLine');
   if (!el) return;
-  el.textContent = text;
-  el.className = statusClass(kind);
+  $('.player-shell')?.classList.toggle('is-empty', !state.currentMediaUrl || state.currentMediaType !== 'video');
+  if (!state.currentMediaUrl) {
+    el.textContent = '';
+    el.classList.add('is-empty');
+    return;
+  }
+  const track = currentTrackFromQueue(state.currentMediaType);
+  const meta = state.currentMediaType === 'audio' ? state.currentMediaMeta : null;
+  const title = track?.title || meta?.title || fileTitleFromUrl(state.currentMediaUrl);
+  const artist = state.currentMediaType === 'audio' ? (track?.artist || meta?.artist || '') : '';
+  el.textContent = artist ? `${title} · ${artist}` : title;
+  el.classList.remove('is-empty');
 }
 
 function feedbackKindFromText(text = '') {
@@ -200,6 +409,7 @@ function triggerButtonFeedback(button, kind = 'press') {
   }, 460);
 }
 
+// The icon shows the action (press to play / press to pause), matching the player's own bar.
 function setPlaybackToggleButton(button, isPlaying) {
   if (!button) return;
   const icon = button.querySelector('.button-icon');
@@ -208,15 +418,15 @@ function setPlaybackToggleButton(button, isPlaying) {
   button.setAttribute('aria-label', isPlaying ? '暂停' : '播放');
   button.title = isPlaying ? '暂停' : '播放';
   if (icon) {
-    icon.classList.toggle('icon-play', isPlaying);
-    icon.classList.toggle('icon-pause', !isPlaying);
+    icon.classList.toggle('icon-pause', isPlaying);
+    icon.classList.toggle('icon-play', !isPlaying);
   }
 }
 
 function renderPlaybackControls() {
   const isPlaying = Boolean(state.currentMediaUrl && state.desiredPlaying);
   setPlaybackToggleButton($('#playBtn'), isPlaying);
-  setPlaybackToggleButton($('#musicPlayBtn'), isPlaying && state.currentMediaType === 'audio');
+  renderNowPlayingLine();
 }
 
 function toggleCurrentPlayback(button) {
@@ -292,12 +502,29 @@ function updateNodeConfigSslFields() {
 }
 
 function updateMetrics() {
-  const stats = state.config?.stats || {};
-  $('#metricRooms').textContent = stats.rooms ?? state.rooms.length;
-  $('#metricSyncNodes').textContent = stats.syncNodes ?? state.config?.syncNodes?.length ?? 0;
-  $('#metricStorageNodes').textContent = stats.storageNodes ?? state.config?.storageNodes?.length ?? 0;
-  const activeUpdates = state.admin.updateJobs.filter((job) => ['queued', 'running'].includes(job.status)).length;
-  $('#metricInstallJobs').textContent = (stats.installJobs ?? state.admin.jobs.filter((job) => ['queued', 'running'].includes(job.status)).length) + activeUpdates;
+  const count = $('#roomCount');
+  if (count) count.textContent = String(state.rooms.length);
+}
+
+function roomIdFromHash() {
+  const match = String(location.hash || '').match(/^#room\/([A-Za-z0-9_-]+)$/);
+  return match ? match[1] : '';
+}
+
+function setRoomHash(roomId) {
+  const next = roomId ? `#room/${roomId}` : '';
+  if ((location.hash || '') === next) return;
+  if (next) {
+    state.ignoreNextHashChange = true;
+    location.hash = next;
+  } else {
+    history.replaceState(null, '', `${location.pathname}${location.search}`);
+  }
+}
+
+function updateRoomTab() {
+  const tab = $('#roomTab');
+  if (tab) tab.disabled = !state.currentRoom;
 }
 
 function setAuthMode(mode) {
@@ -321,22 +548,28 @@ function showAuthenticated(user) {
 
 function showLoggedOut() {
   state.user = null;
+  state.currentRoom = null;
   $('#authView').classList.remove('hidden');
   $('#appView').classList.add('hidden');
   $('#logoutBtn').classList.add('hidden');
   $('#currentUser').textContent = '';
+  setRoomHash('');
+  updateRoomTab();
 }
 
 function switchView(view) {
+  if (view === 'room' && !state.currentRoom) view = 'lobby';
   for (const name of ['lobby', 'room', 'admin']) {
     $(`#${name}View`).classList.toggle('hidden', name !== view);
   }
   for (const button of document.querySelectorAll('.tab-button')) {
     button.classList.toggle('active', button.dataset.view === view);
   }
-  const titles = { lobby: '房间大厅', room: state.currentRoom?.name || '观看房间', admin: '管理员后台' };
-  $('#surfaceTitle').textContent = titles[view] || 'Video Together';
-  if (view === 'admin') loadAdmin();
+  const titles = { lobby: '大厅', room: state.currentRoom?.name || '房间', admin: '后台' };
+  $('#surfaceTitle').textContent = titles[view] || 'PlayTogether';
+  setRoomHash(view === 'room' ? state.currentRoom?.id : '');
+  if (view === 'admin') loadAdmin().catch((error) => toast(error.message));
+  if (view === 'room') requestAnimationFrame(() => updateMusicProgressUi());
 }
 
 function switchAdminPage(page) {
@@ -380,14 +613,18 @@ function renderSyncSelect() {
 
 function renderRooms() {
   const list = $('#roomList');
+  const key = JSON.stringify(state.rooms.map((room) => [room.id, room.name, room.syncNodeEnabled, room.updatedAt, state.currentRoom?.id === room.id]));
+  if (key === state.roomsKey && list.childElementCount) return;
+  state.roomsKey = key;
   list.innerHTML = '';
   if (!state.rooms.length) {
-    renderEmpty(list, '暂无房间');
+    renderEmpty(list, '还没有房间');
     return;
   }
   for (const room of state.rooms) {
+    const isCurrent = state.currentRoom?.id === room.id;
     const item = document.createElement('div');
-    item.className = 'list-item room-item';
+    item.className = `list-item room-item${isCurrent ? ' is-current' : ''}`;
     const main = document.createElement('div');
     const title = document.createElement('p');
     title.className = 'item-title';
@@ -395,16 +632,22 @@ function renderRooms() {
     const meta = document.createElement('p');
     meta.className = 'item-meta';
     meta.textContent = `${room.ownerName} · ${room.syncNodeName} · ${formatTime(room.createdAt)}`;
-    const badge = document.createElement('span');
-    badge.className = statusClass(room.syncNodeEnabled ? 'good' : 'bad');
-    badge.textContent = room.syncNodeEnabled ? '可加入' : '节点停用';
-    main.append(title, meta, badge);
+    main.append(title, meta);
+    if (!room.syncNodeEnabled) {
+      const badge = document.createElement('span');
+      badge.className = statusClass('bad');
+      badge.textContent = '节点停用';
+      main.appendChild(badge);
+    }
     const join = document.createElement('button');
-    join.className = 'primary-pill';
+    join.className = isCurrent ? 'secondary-pill' : 'primary-pill';
     join.type = 'button';
-    join.textContent = '加入';
+    join.textContent = isCurrent ? '返回' : '加入';
     join.disabled = !room.syncNodeEnabled;
-    join.addEventListener('click', () => withBusy(join, () => joinRoom(room.id), '加入中'));
+    join.addEventListener('click', () => {
+      if (isCurrent) return switchView('room');
+      withBusy(join, () => joinRoom(room.id), '加入中');
+    });
     item.append(main, join);
     list.appendChild(item);
   }
@@ -414,10 +657,13 @@ async function joinRoom(roomId) {
   const data = await api(`/api/rooms/${roomId}/join`, { method: 'POST' });
   state.currentRoom = data.room;
   state.config.storageNodes = data.storageNodes || state.config.storageNodes || [];
-  $('#roomNameLabel').textContent = data.room.name;
-  $('#videoUrlInput').value = state.currentMediaUrl || state.currentVideoUrl;
+  state.roomsKey = '';
+  state.sync.drift = 0;
+  state.sync.mode = 'idle';
   renderStorageSelects();
   connectSync(data);
+  updateRoomTab();
+  renderRooms();
   switchView('room');
 }
 
@@ -426,45 +672,48 @@ function connectSync(data) {
     state.ws._manualClose = true;
     state.ws.close();
   }
-  clearInterval(state.syncTimer);
   clearTimeout(state.reconnectTimer);
   stopLatencyMonitor();
   state.roomSession = data;
   state.reconnectAttempts = 0;
+  state.sync.clockOffset = 0;
+  state.sync.clockSamples = [];
   openRoomSocket(data);
 }
 
+function reconnectDelay(attempt) {
+  const base = Math.min(RECONNECT_MAX_DELAY_MS, 1000 * 2 ** Math.max(0, attempt - 1));
+  return base + Math.random() * 400;
+}
+
 function openRoomSocket(data) {
+  if (state.ws && state.ws.readyState <= WebSocket.OPEN && state.ws._session === data) return;
   const url = `${data.syncNode.wsUrl}?token=${encodeURIComponent(data.token)}`;
   const ws = new WebSocket(url);
+  ws._session = data;
   state.ws = ws;
-  setSyncStatus('连接中', 'warn');
+  setSyncConnection(state.reconnectAttempts ? 'reconnecting' : 'connecting');
   ws.addEventListener('open', () => {
     state.reconnectAttempts = 0;
-    setSyncStatus(`${data.syncNode.name} 已连接`, 'good');
+    setSyncConnection('online');
+    settleSyncMode();
     startLatencyMonitor();
-    state.syncTimer = setInterval(() => {
-      if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify({ type: 'request_sync' }));
-    }, 1000);
   });
   ws.addEventListener('close', () => {
-    clearInterval(state.syncTimer);
+    if (state.ws !== ws) return;
     stopLatencyMonitor();
+    state.ws = null;
     if (ws._manualClose || !state.roomSession) {
-      setSyncStatus('已断开', 'muted');
+      setSyncConnection('offline');
       return;
     }
+    // Reconnect forever with capped backoff; the sync button doubles as a manual retry.
     state.reconnectAttempts += 1;
-    if (state.reconnectAttempts > 6) {
-      setSyncStatus('连接失败', 'bad');
-      return;
-    }
-    setSyncStatus(`重连中 ${state.reconnectAttempts}/6`, 'warn');
+    setSyncConnection(state.reconnectAttempts > 3 ? 'failed' : 'reconnecting');
     clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = setTimeout(() => openRoomSocket(state.roomSession), Math.min(12000, 1000 * state.reconnectAttempts));
-  });
-  ws.addEventListener('error', () => {
-    setSyncStatus('连接异常', 'bad');
+    state.reconnectTimer = setTimeout(() => {
+      if (state.roomSession && !state.ws) openRoomSocket(state.roomSession);
+    }, reconnectDelay(state.reconnectAttempts));
   });
   ws.addEventListener('message', (event) => {
     let message;
@@ -477,13 +726,24 @@ function openRoomSocket(data) {
       renderMembers(message.members || []);
       renderMessages(message.messages || []);
       applyRemoteState(message.state, 'snapshot');
+      return;
     }
     if (message.type === 'members') renderMembers(message.members || []);
-    if (message.type === 'state' || message.type === 'state_sync') applyRemoteState(message.state, message.reason || message.type);
-    if (message.type === 'chat') appendChat(message.message);
-    if (message.type === 'danmaku') showDanmaku(message.message);
-    if (message.type === 'latency_pong') handleLatencyPong(message);
+    else if (message.type === 'state' || message.type === 'state_sync') applyRemoteState(message.state, message.reason || message.type);
+    else if (message.type === 'chat') {
+      appendChat(message.message);
+      showDanmaku(message.message);
+    } else if (message.type === 'danmaku') showDanmaku(message.message);
+    else if (message.type === 'latency_pong') handleLatencyPong(message);
+    else if (message.type === 'notice') toast(message.text || '');
   });
+}
+
+function resumeRoomConnectionIfNeeded() {
+  if (!state.roomSession || document.hidden) return;
+  if (state.ws && state.ws.readyState <= WebSocket.OPEN) return;
+  clearTimeout(state.reconnectTimer);
+  openRoomSocket(state.roomSession);
 }
 
 function startLatencyMonitor() {
@@ -496,7 +756,7 @@ function stopLatencyMonitor(clearDisplay = true) {
   clearInterval(state.latencyTimer);
   state.latencyTimer = null;
   state.latencyPending.clear();
-  if (clearDisplay) setLatencyStatus(null);
+  if (clearDisplay) setSyncLatency(null);
 }
 
 function sendLatencyPing() {
@@ -511,16 +771,37 @@ function sendLatencyPing() {
   setTimeout(() => {
     if (state.latencyPending.has(id)) {
       state.latencyPending.delete(id);
-      setLatencyStatus(null);
+      setSyncLatency(null);
     }
   }, 5000);
+}
+
+// The room position is extrapolated from the node's clock, so every member needs to know how far
+// its own clock is from the node's. Otherwise clock skew between machines shows up as drift and
+// members end up "in sync" with themselves but seconds apart from each other.
+function updateClockOffset(offset, rtt) {
+  const samples = state.sync.clockSamples;
+  samples.push({ offset, rtt });
+  if (samples.length > 8) samples.shift();
+  const best = samples.slice().sort((a, b) => a.rtt - b.rtt).slice(0, 3);
+  state.sync.clockOffset = best.reduce((sum, sample) => sum + sample.offset, 0) / best.length;
+}
+
+function serverNow() {
+  return Date.now() + (state.sync.clockOffset || 0);
 }
 
 function handleLatencyPong(message) {
   const startedAt = state.latencyPending.get(message.id);
   if (!startedAt) return;
   state.latencyPending.delete(message.id);
-  setLatencyStatus(performance.now() - startedAt);
+  const rtt = performance.now() - startedAt;
+  setSyncLatency(rtt);
+  const serverTime = Number(message.serverTime);
+  const clientTime = Number(message.clientTime);
+  if (Number.isFinite(serverTime) && Number.isFinite(clientTime)) {
+    updateClockOffset(serverTime - (clientTime + rtt / 2), rtt);
+  }
 }
 
 function prepareMediaElement(media) {
@@ -597,7 +878,7 @@ function initVideoPlayer() {
               lowLatencyMode: false
             });
             state.hls.on(Hls.Events.ERROR, (event, data) => {
-              if (data?.fatal) setBufferStatus('HLS 播放失败', 'bad');
+              if (data?.fatal) setSyncMode('error', 'HLS 无法播放');
             });
             state.hls.on(Hls.Events.MANIFEST_PARSED, () => finishSourcePreload());
             state.hls.loadSource(url);
@@ -677,10 +958,26 @@ function loadMedia() {
 function setPlaybackRate(rate) {
   const art = state.currentMediaType === 'video' ? state.artPlayer || getPlayerCore() : null;
   const media = getMedia();
+  state.sync.nudgeRate = rate;
   try {
     if (art) art.playbackRate = rate;
     if (media) media.playbackRate = rate;
   } catch {}
+}
+
+// Gentle convergence: speed up or slow down by up to 20% so a member a second or two off drifts
+// back into step within a few seconds, without the jump cut a seek would cause. Nudging starts
+// past SOFT and only releases once well inside it, so the rate does not flap around the edge.
+function applyDriftNudge(drift, media) {
+  const abs = Math.abs(drift);
+  const nudging = state.sync.nudgeRate !== 1;
+  const threshold = nudging ? NUDGE_RELEASE_THRESHOLD_SECONDS : SOFT_SYNC_THRESHOLD_SECONDS;
+  let rate = 1;
+  if (abs >= threshold && media?.readyState >= 3) {
+    const delta = Math.min(NUDGE_RATE_MAX_DELTA, 0.06 + abs * 0.08);
+    rate = Number((drift > 0 ? 1 + delta : 1 - delta).toFixed(3));
+  }
+  if (rate !== state.sync.nudgeRate) setPlaybackRate(rate);
 }
 
 function sendState(reason, overrides = {}) {
@@ -703,7 +1000,7 @@ function sendState(reason, overrides = {}) {
       }
     }));
   } catch {
-    setSyncStatus('同步发送失败', 'bad');
+    toast('同步发送失败');
   }
 }
 
@@ -786,7 +1083,7 @@ function localRoomStatePatch(isPlaying, position = getMediaTime()) {
     playbackModes: normalizePlaybackModes(state.playbackModes),
     isPlaying,
     position,
-    serverTime: Date.now()
+    serverTime: serverNow()
   };
 }
 
@@ -805,7 +1102,7 @@ function commitLocalPlay(reason = 'play') {
   state.desiredPlaying = true;
   state.latestRemoteState = localRoomStatePatch(true);
   markLocalPlay();
-  clearCatchupStatus(0);
+  clearCatchupStatus();
   renderMediaQueue();
   renderPlaybackControls();
   sendState(reason, { isPlaying: true });
@@ -816,7 +1113,7 @@ function commitLocalPause(reason = 'pause') {
   state.desiredPlaying = false;
   state.latestRemoteState = localRoomStatePatch(false);
   markExplicitPause(6000);
-  clearCatchupStatus(0);
+  clearCatchupStatus();
   setPlaybackRate(1);
   renderMediaQueue();
   renderPlaybackControls();
@@ -827,7 +1124,7 @@ function remoteTargetPosition(remote = state.latestRemoteState) {
   if (!remote) return 0;
   let position = Number(remote.position || 0);
   if (remote.isPlaying && Number.isFinite(Number(remote.serverTime))) {
-    position += Math.max(0, (Date.now() - Number(remote.serverTime)) / 1000);
+    position += Math.max(0, (serverNow() - Number(remote.serverTime)) / 1000);
   }
   return Math.max(0, position);
 }
@@ -860,18 +1157,12 @@ function canApplyProgressSeek(media, target) {
   return hasBufferedTarget(media, target, 0.5) || mediaCanSeek(media) || media?.readyState >= 3;
 }
 
-function clearCatchupStatus(delay = 1800) {
+function clearCatchupStatus() {
   clearTimeout(state.catchupTimer);
   state.catchupTimer = null;
   state.bufferingLocally = false;
-  setPlaybackRate(1);
-  if (delay) {
-    setTimeout(() => {
-      if (!state.bufferingLocally) setBufferStatus('缓冲状态 -', 'muted');
-    }, delay);
-  } else {
-    setBufferStatus('缓冲状态 -', 'muted');
-  }
+  if (state.sync.nudgeRate !== 1) setPlaybackRate(1);
+  settleSyncMode();
 }
 
 function mediaCanSeek(media = getMedia()) {
@@ -892,12 +1183,14 @@ function seekMediaTo(target, suppressDuration = 900) {
   markProgrammaticSeek(Math.max(2500, suppressDuration + 2500));
   markSeekIntent();
   suppressLocalMediaEvents(suppressDuration);
+  if (state.sync.nudgeRate !== 1) setPlaybackRate(1);
   try {
     const nextTime = Math.max(0, target);
     if (art) art.currentTime = nextTime;
     else media.currentTime = nextTime;
     state.lastSeekTarget = Math.max(0, target);
     state.lastCatchupSeekAt = Date.now();
+    state.sync.drift = 0;
   } catch {}
 }
 
@@ -921,11 +1214,12 @@ function finishSourcePreload() {
   if (state.pendingAutoplay && state.desiredPlaying && !hasExplicitPauseIntent()) {
     markLocalPlay();
     suppressLocalMediaEvents(900);
-    playMedia().catch(() => {
-      setBufferStatus('已预加载，点击播放继续同步', 'warn');
+    playMedia().then(() => settleSyncMode()).catch(() => {
+      // Autoplay was blocked: the room is playing but this tab needs a gesture first.
+      setSyncMode('ready', '点击播放');
     });
   } else if (state.currentMediaUrl) {
-    setBufferStatus('预加载完成', 'good');
+    setSyncMode(state.desiredPlaying ? 'ready' : 'paused');
   }
 }
 
@@ -935,7 +1229,7 @@ function runCatchup() {
   const media = getMedia();
   const remote = state.latestRemoteState;
   if (hasLocalSeekIntent() || media?.seeking) {
-    setBufferStatus('定位缓冲中', 'warn');
+    setSyncMode('seeking');
     return;
   }
   if (!media || !remote?.isPlaying || !state.currentMediaUrl || hasExplicitPauseIntent() || !state.desiredPlaying) {
@@ -957,33 +1251,37 @@ function runCatchup() {
     suppressLocalMediaEvents(900);
     playMedia()
       .then(() => {
-        const nextDrift = remoteTargetPosition(remote) - getMediaTime();
-        setPlaybackRate(1);
-        setBufferStatus(Math.abs(nextDrift) > PROGRESS_SYNC_THRESHOLD_SECONDS ? '已恢复，继续检测进度差' : '播放已同步', 'good');
-        clearCatchupStatus(1800);
+        state.sync.drift = remoteTargetPosition(remote) - getMediaTime();
+        clearCatchupStatus();
       })
-      .catch(() => scheduleCatchup('等待浏览器允许播放'));
+      .catch(() => scheduleCatchup('blocked'));
     return;
   }
-  setBufferStatus(`本地缓冲中 · 已缓存 ${ahead.toFixed(1)}s`, 'warn');
+  setSyncMode('buffering', ahead > 0 ? `已缓存 ${ahead.toFixed(1)}s` : '');
   state.catchupTimer = setTimeout(runCatchup, 900);
 }
 
-function scheduleCatchup(reason = '缓冲') {
+// `reason` is a hint: 'blocked' means the browser refused to play without a gesture, anything
+// else means we are behind because of buffering or a stall and will catch up automatically.
+function scheduleCatchup(reason = 'buffering') {
   const remote = state.latestRemoteState;
   if (!remote?.isPlaying || !state.currentMediaUrl || hasExplicitPauseIntent() || !state.desiredPlaying) return;
   const media = getMedia();
+  if (reason === 'blocked' || /等待/.test(reason)) {
+    setSyncMode('ready', '点击播放');
+    return;
+  }
   if (!shouldSyncByProgress(remote, media)) return;
   if (hasLocalSeekIntent() || media?.seeking) {
-    setBufferStatus('定位缓冲中', 'warn');
+    setSyncMode('seeking');
     return;
   }
   if (state.sourceLoading) {
-    setBufferStatus('预加载中', 'warn');
+    setSyncMode('loading');
     return;
   }
   state.bufferingLocally = true;
-  setBufferStatus(`${reason}，恢复后自动追赶`, 'warn');
+  setSyncMode('catching');
   clearTimeout(state.catchupTimer);
   state.catchupTimer = setTimeout(runCatchup, 350);
 }
@@ -1000,7 +1298,7 @@ function updateMediaModeUi() {
   const isAudioMode = state.roomMode === 'audio';
   $('.player-shell')?.classList.toggle('hidden', isAudioMode);
   $('#musicPanel')?.classList.toggle('hidden', !isAudioMode);
-  $('.video-transport')?.classList.toggle('hidden', isAudioMode);
+  $('.stage')?.classList.toggle('is-audio', isAudioMode);
   $('#roomModeVideoBtn')?.classList.toggle('active', state.roomMode === 'video');
   $('#roomModeAudioBtn')?.classList.toggle('active', state.roomMode === 'audio');
   const input = $('#videoUrlInput');
@@ -1061,6 +1359,8 @@ function setMediaSource(url, options = {}) {
   state.pendingLocalSeekTarget = null;
   state.lastSeekTarget = null;
   state.lastCatchupSeekAt = 0;
+  state.sync.drift = 0;
+  if (state.sync.nudgeRate !== 1) setPlaybackRate(1);
   if (Number.isFinite(targetTime) && targetTime > 0) setPendingSeek(targetTime);
   else state.pendingSeekTime = null;
   updateMediaModeUi();
@@ -1077,15 +1377,15 @@ function setMediaSource(url, options = {}) {
     state.sourceLoading = false;
     state.pendingAutoplay = false;
     state.pendingSeekTime = null;
-    clearCatchupStatus(0);
+    clearCatchupStatus();
     updateMediaModeUi();
     return;
   }
   player.preload = 'auto';
+  setSyncMode('loading');
   if (mediaType === 'audio') {
     player.src = url;
     loadMedia();
-    setBufferStatus('音乐预加载中', 'warn');
     updateMusicProgressUi();
     return;
   }
@@ -1100,14 +1400,13 @@ function setMediaSource(url, options = {}) {
       .catch(() => {
         state.sourceLoading = false;
         state.pendingAutoplay = false;
-        setBufferStatus('视频加载失败', 'bad');
+        setSyncMode('error', '视频无法加载');
       });
   } else {
     player.src = url;
     loadMedia();
   }
   ensureVideoVisible();
-  setBufferStatus('预加载中', 'warn');
 }
 
 function setVideoSource(url, options = {}) {
@@ -1178,7 +1477,7 @@ function renderMusicPanel() {
   const artist = $('#musicArtist');
   const cover = $('#musicCover');
   if (title) title.textContent = state.currentMediaType === 'audio' && state.currentMediaUrl ? meta.title : '未选择音乐';
-  if (artist) artist.textContent = state.currentMediaType === 'audio' && state.currentMediaUrl ? (meta.artist || meta.album || '未知艺术家') : '从媒体库或直链菜单添加歌曲';
+  if (artist) artist.textContent = state.currentMediaType === 'audio' && state.currentMediaUrl ? (meta.artist || meta.album || '') : '';
   applyMusicCover(cover, meta);
   ensureCurrentAudioMetadata();
   updateMusicProgressUi();
@@ -1225,7 +1524,8 @@ function renderMediaQueue() {
     const isCurrentTrack = track.id === state.currentTrackId && state.currentMediaType === mediaType;
     const isPlayingTrack = isCurrentTrack && state.desiredPlaying;
     const trackTitle = track.title || fileTitleFromUrl(track.mediaUrl);
-    const trackArtist = track.artist || track.album || (isAudioQueue ? '未知艺术家' : modeLabel(mediaType));
+    const trackDuration = Number(track.duration) > 0 ? formatClock(track.duration) : '';
+    const trackArtist = [track.artist || track.album, trackDuration].filter(Boolean).join(' · ') || modeLabel(mediaType);
     const row = document.createElement('div');
     row.className = [
       'music-queue-item',
@@ -1244,7 +1544,7 @@ function renderMediaQueue() {
       cover = document.createElement('div');
       cover.className = 'queue-track-cover';
       cover.textContent = track.coverUrl ? '' : (trackTitle || '音').slice(0, 1).toUpperCase();
-      cover.style.backgroundImage = track.coverUrl ? `url("${track.coverUrl}")` : '';
+      cover.style.backgroundImage = track.coverUrl ? coverImageValue(track.coverUrl) : '';
     }
     const main = document.createElement('button');
     main.className = 'music-queue-main';
@@ -1256,9 +1556,7 @@ function renderMediaQueue() {
     const name = document.createElement('strong');
     name.textContent = trackTitle;
     const meta = document.createElement('span');
-    meta.textContent = isAudioQueue
-      ? trackArtist
-      : [track.artist, formatClock(track.duration)].filter(Boolean).join(' · ') || modeLabel(mediaType);
+    meta.textContent = trackArtist;
     main.append(name, meta);
     if (isAudioQueue && isPlayingTrack) {
       const wave = document.createElement('span');
@@ -1540,6 +1838,7 @@ function requestRoomMode(mediaType) {
     return false;
   }
   const previousMode = state.roomMode;
+  if (previousMode === roomMode && state.currentMediaType === roomMode) return true;
   state.roomMode = roomMode;
   state.currentMediaType = roomMode;
   if (previousMode !== roomMode) stopInactiveMedia(roomMode);
@@ -1553,6 +1852,24 @@ function requestRoomMode(mediaType) {
   }
 }
 
+function queuedTrackForUrl(url, mediaType) {
+  const target = comparableMediaUrl(url);
+  if (!target) return null;
+  return queueFor(mediaType).find((track) => comparableMediaUrl(track.mediaUrl || track.videoUrl) === target) || null;
+}
+
+// Reports the real duration back to the room once the media element knows it, so queue rows
+// show a length instead of nothing.
+function reportCurrentTrackDuration() {
+  const media = getMedia();
+  const track = currentTrackFromQueue(state.currentMediaType);
+  const duration = Number(media?.duration);
+  if (!track || !Number.isFinite(duration) || duration <= 0) return;
+  if (Number(track.duration) > 0 && Math.abs(Number(track.duration) - duration) < 1) return;
+  track.duration = duration;
+  sendQueueMessage('queue_update', { mediaType: state.currentMediaType, trackId: track.id, patch: { duration } });
+}
+
 async function addMediaTrack(url, options = {}) {
   const normalized = normalizeMediaInput(url);
   if (normalized === null || !normalized) {
@@ -1560,6 +1877,12 @@ async function addMediaTrack(url, options = {}) {
     return false;
   }
   const mediaType = normalizeMediaType(options.mediaType || state.roomMode);
+  // Playing something that is already queued jumps to it instead of adding a duplicate row.
+  const existing = queuedTrackForUrl(normalized, mediaType);
+  if (existing) {
+    if (options.playNow) return sendQueueMessage('queue_play', { mediaType, trackId: existing.id });
+    return true;
+  }
   const track = buildFallbackTrack(normalized, { ...options, mediaType, name: options.name || fileTitleFromUrl(normalized) });
   const sent = sendQueueMessage('queue_add', { mediaType, track, playNow: Boolean(options.playNow) });
   if (sent && mediaType === 'audio') enrichAudioTrackMetadata(track);
@@ -1581,6 +1904,8 @@ function applyRemoteState(remote, reason = 'state_sync') {
   const remoteMediaUrl = remote.mediaUrl || remote.videoUrl || '';
   const remoteRoomMode = normalizeMediaType(remote.roomMode || remote.mediaType || state.roomMode);
   const remoteMediaType = normalizeMediaType(remote.mediaType || remoteRoomMode);
+  const mediaChanged = remoteMediaUrl !== state.currentMediaUrl || remoteMediaType !== state.currentMediaType;
+  if (isNewerRemoteState && reason !== 'state_sync' && reason !== 'snapshot') noteRemoteAction(remote, reason, mediaChanged);
   state.roomMode = remoteRoomMode;
   state.mediaQueues = normalizeMediaQueues(remote.mediaQueues || { audio: remote.musicQueue || state.mediaQueues.audio, video: state.mediaQueues.video });
   state.playbackModes = normalizePlaybackModes(remote.playbackModes || state.playbackModes);
@@ -1592,7 +1917,7 @@ function applyRemoteState(remote, reason = 'state_sync') {
     : state.currentMediaMeta;
   updateMediaModeUi();
   const target = remoteTargetPosition(remote);
-  if (remoteMediaUrl !== state.currentMediaUrl || remoteMediaType !== state.currentMediaType) {
+  if (mediaChanged) {
     state.latestRemoteState = remote;
     state.desiredPlaying = Boolean(remote.isPlaying);
     suppressLocalMediaEvents(1200);
@@ -1613,50 +1938,49 @@ function applyRemoteState(remote, reason = 'state_sync') {
   if (isPeriodicSync && !isNewerRemoteState && remote.isPlaying && hasExplicitPauseIntent()) return;
   if (isPeriodicSync && !isNewerRemoteState && !remote.isPlaying && hasLocalPlayIntent()) return;
   state.latestRemoteState = remote;
-  const shouldApplyProgressSync = !isPeriodicSync || Math.abs(drift) > PROGRESS_SYNC_THRESHOLD_SECONDS;
   state.desiredPlaying = Boolean(remote.isPlaying);
   if (!remote.isPlaying) state.pendingAutoplay = false;
+  state.sync.drift = remote.isPlaying && !player.paused ? drift : 0;
   renderMediaQueue();
   updateMusicProgressUi();
   renderPlaybackControls();
-  if (!shouldApplyProgressSync) {
-    clearCatchupStatus(0);
-    if (!player.paused) setPlaybackRate(1);
-  } else {
-    const seekThreshold = isPeriodicSync ? PROGRESS_SYNC_THRESHOLD_SECONDS : 0.35;
-    if (remote.isPlaying) {
-      if (hasExplicitPauseIntent() && !isNewerRemoteState) return;
-      if (state.sourceLoading) {
-        setPendingSeek(target);
-        state.pendingAutoplay = true;
-        return;
-      }
-      applyPendingSeek();
-      if (Math.abs(drift) > seekThreshold) {
-        if (canApplyProgressSeek(player, target)) {
-          seekMediaTo(target, 900);
-        } else {
-          scheduleCatchup('缓存追赶');
-        }
-      } else if (Math.abs(drift) < 0.45) {
-        setPlaybackRate(1);
-      }
-    } else {
-      clearCatchupStatus(0);
-      state.pendingAutoplay = false;
-      if (state.sourceLoading) {
-        setPendingSeek(target);
-        return;
-      }
-      applyPendingSeek();
-      if (Number.isFinite(target) && Math.abs(drift) > seekThreshold) seekMediaTo(target, 900);
+  // Explicit actions (play/pause/seek/queue) align tightly; the once-a-second heartbeat only seeks
+  // past HARD and otherwise nudges the playback rate so nobody sees a jump.
+  const seekThreshold = isPeriodicSync ? PROGRESS_SYNC_THRESHOLD_SECONDS : 0.35;
+  if (remote.isPlaying) {
+    if (hasExplicitPauseIntent() && !isNewerRemoteState) return;
+    if (state.sourceLoading) {
+      setPendingSeek(target);
+      state.pendingAutoplay = true;
+      return;
     }
+    applyPendingSeek();
+    if (Math.abs(drift) > seekThreshold) {
+      if (canApplyProgressSeek(player, target)) {
+        seekMediaTo(target, 900);
+      } else {
+        scheduleCatchup('buffering');
+      }
+    } else if (isPeriodicSync && !player.paused && !state.bufferingLocally) {
+      applyDriftNudge(drift, player);
+    } else if (!isPeriodicSync && state.sync.nudgeRate !== 1) {
+      setPlaybackRate(1);
+    }
+  } else {
+    clearCatchupStatus();
+    state.pendingAutoplay = false;
+    if (state.sourceLoading) {
+      setPendingSeek(target);
+      return;
+    }
+    applyPendingSeek();
+    if (Number.isFinite(target) && Math.abs(drift) > seekThreshold) seekMediaTo(target, 900);
   }
   if (remote.isPlaying && state.currentMediaUrl && player.paused) {
     if (hasExplicitPauseIntent() && !isNewerRemoteState) return;
     markLocalPlay();
     suppressLocalMediaEvents(1200);
-    playMedia().catch(() => scheduleCatchup('等待播放'));
+    playMedia().then(() => settleSyncMode()).catch(() => scheduleCatchup('blocked'));
     return;
   }
   if (!remote.isPlaying && !player.paused) {
@@ -1670,34 +1994,47 @@ function applyRemoteState(remote, reason = 'state_sync') {
       pauseMedia();
       clearCatchupStatus();
     }
+    return;
   }
+  if (!state.bufferingLocally && !state.sourceLoading) settleSyncMode();
 }
 
 function renderMembers(members) {
   const list = $('#memberList');
-  list.innerHTML = '';
+  const key = members.map((member) => member.username).join(' ');
   $('#memberCount').textContent = String(members.length);
+  if (key === state.membersKey && list.childElementCount) return;
+  state.membersKey = key;
+  list.innerHTML = '';
   if (!members.length) {
     renderEmpty(list, '暂无成员');
     return;
   }
+  const me = selfName();
   for (const member of members) {
     const chip = document.createElement('span');
-    chip.className = 'member-chip';
+    chip.className = `member-chip${member.username === me ? ' is-self' : ''}`;
     chip.textContent = member.username;
     list.appendChild(chip);
   }
 }
 
 function renderMessages(messages) {
-  $('#chatMessages').innerHTML = '';
-  for (const message of messages) appendChat(message);
+  const box = $('#chatMessages');
+  box.innerHTML = '';
+  const fragment = document.createDocumentFragment();
+  for (const message of messages) {
+    const el = buildChatMessage(message);
+    if (el) fragment.appendChild(el);
+  }
+  box.appendChild(fragment);
+  box.scrollTop = box.scrollHeight;
 }
 
-function appendChat(message) {
-  if (!message) return;
+function buildChatMessage(message) {
+  if (!message) return null;
   const wrap = document.createElement('div');
-  wrap.className = 'chat-message';
+  wrap.className = `chat-message${message.username === selfName() ? ' is-self' : ''}`;
   const name = document.createElement('div');
   name.className = 'chat-name';
   name.textContent = message.username;
@@ -1705,15 +2042,30 @@ function appendChat(message) {
   text.className = 'chat-text';
   text.textContent = message.text;
   wrap.append(name, text);
+  return wrap;
+}
+
+function appendChat(message) {
+  const el = buildChatMessage(message);
+  if (!el) return;
   const box = $('#chatMessages');
-  box.appendChild(wrap);
-  box.scrollTop = box.scrollHeight;
+  const pinned = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+  box.appendChild(el);
+  while (box.childElementCount > CHAT_DOM_LIMIT) box.firstElementChild.remove();
+  if (pinned) box.scrollTop = box.scrollHeight;
 }
 
 function showDanmaku(message) {
+  if (!message || state.roomMode !== 'video') return;
+  if (message.id) {
+    if (state.seenDanmaku.has(message.id)) return;
+    state.seenDanmaku.add(message.id);
+    if (state.seenDanmaku.size > 400) state.seenDanmaku.delete(state.seenDanmaku.values().next().value);
+  }
   attachDanmakuLayerToPlayer();
   const layer = $('#danmakuLayer');
-  if (!layer) return;
+  if (!layer || document.hidden) return;
+  while (layer.childElementCount >= DANMAKU_DOM_LIMIT) layer.firstElementChild.remove();
   const el = document.createElement('div');
   el.className = 'danmaku';
   el.textContent = `${message.username}: ${message.text}`;
@@ -1754,30 +2106,59 @@ function renderStorageSelects() {
   if (!$('#adminStorageSelect').value && nodes[0]) $('#adminStorageSelect').value = nodes[0].id;
   if ($('#downloadStorageSelect') && !$('#downloadStorageSelect').value && nodes[0]) $('#downloadStorageSelect').value = nodes[0].id;
   if (!nodes.length) {
-    $('#storageBrowserStatus').textContent = '没有可用存储节点';
-    renderEmpty('#storageFileList', '暂无视频库');
+    setStorageBrowserStatus('没有可用存储节点');
+    renderEmpty('#storageFileList', '暂无媒体');
     renderEmpty('#adminFileList', '暂无存储节点');
     renderEmpty('#downloadTaskList', '暂无存储节点');
     return;
   }
-  loadStorageBrowser().catch((error) => {
-    $('#storageBrowserStatus').textContent = error.message;
-  });
+  loadStorageBrowser().catch((error) => setStorageBrowserStatus(error.message));
+}
+
+function setStorageBrowserStatus(text = '') {
+  const el = $('#storageBrowserStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('hidden', !text);
+}
+
+function renderFileSkeleton(selector, count = 6) {
+  const grid = $(selector);
+  if (!grid || grid.querySelector('.file-entry')) return;
+  grid.innerHTML = '';
+  for (let index = 0; index < count; index += 1) {
+    const item = document.createElement('div');
+    item.className = 'file-skeleton';
+    grid.appendChild(item);
+  }
 }
 
 async function loadStorageBrowser() {
   const nodeId = $('#storageNodeSelect').value;
   if (!nodeId) return;
-  $('#storageBrowserStatus').textContent = '加载中';
-  const data = await api(`/api/storage/nodes/${nodeId}/list?path=${encodeURIComponent(state.storagePath)}`);
+  const requestKey = `${nodeId}:${state.storagePath}:${Date.now()}`;
+  state.storageRequestKey = requestKey;
+  setStorageBrowserStatus('');
+  renderFileSkeleton('#storageFileList');
+  let data;
+  try {
+    data = await api(`/api/storage/nodes/${nodeId}/list?path=${encodeURIComponent(state.storagePath)}`);
+  } catch (error) {
+    if (state.storageRequestKey !== requestKey) return;
+    if (/不存在/.test(error.message) && state.storagePath) {
+      state.storagePath = parentPath(state.storagePath);
+      return loadStorageBrowser();
+    }
+    renderEmpty('#storageFileList', '无法读取目录');
+    throw error;
+  }
+  if (state.storageRequestKey !== requestKey) return;
   $('#storagePathLabel').textContent = `/${data.path || ''}`;
-  $('#storageBrowserStatus').textContent = `${data.entries?.length || 0} 项`;
+  $('#storageBackBtn').disabled = !data.path;
   renderFileGrid('#storageFileList', data.entries || [], {
     onDir: (entry) => {
       state.storagePath = entry.path;
-      loadStorageBrowser().catch((error) => {
-        $('#storageBrowserStatus').textContent = error.message;
-      });
+      loadStorageBrowser().catch((error) => setStorageBrowserStatus(error.message));
     },
     onFile: (entry) => {
       const mediaUrl = entry.mediaUrl || entry.videoUrl;
@@ -1913,6 +2294,35 @@ function hydrateFileThumbnail(entry, thumb) {
   });
 }
 
+// Thumbnails are expensive (a metadata request per audio file, a media element per video), so
+// they only load once a card scrolls into view.
+function thumbObserver() {
+  if (state.thumbObserver) return state.thumbObserver;
+  if (!('IntersectionObserver' in window)) return null;
+  state.thumbObserver = new IntersectionObserver((records) => {
+    for (const record of records) {
+      if (!record.isIntersecting) continue;
+      state.thumbObserver.unobserve(record.target);
+      record.target._hydrate?.();
+      delete record.target._hydrate;
+    }
+  }, { rootMargin: '200px 0px' });
+  return state.thumbObserver;
+}
+
+function hydrateVideoPreview(thumb, mediaUrl) {
+  const preview = document.createElement('video');
+  preview.preload = 'metadata';
+  preview.muted = true;
+  preview.playsInline = true;
+  preview.tabIndex = -1;
+  preview.setAttribute('aria-hidden', 'true');
+  preview.addEventListener('loadeddata', () => thumb.classList.add('has-preview'), { once: true });
+  preview.addEventListener('error', () => preview.remove(), { once: true });
+  preview.src = mediaUrl;
+  thumb.insertBefore(preview, thumb.firstChild);
+}
+
 function createFileThumbnail(entry, mediaUrl, shouldHydrateAudio = false) {
   const thumb = document.createElement('span');
   thumb.className = [
@@ -1924,31 +2334,38 @@ function createFileThumbnail(entry, mediaUrl, shouldHydrateAudio = false) {
   const label = document.createElement('span');
   label.className = 'file-thumb-label';
   label.textContent = fileEntryLabel(entry);
-  if (entry.type === 'file' && entry.isVideo && mediaUrl) {
-    const preview = document.createElement('video');
-    preview.src = mediaUrl;
-    preview.preload = 'metadata';
-    preview.muted = true;
-    preview.playsInline = true;
-    preview.tabIndex = -1;
-    preview.setAttribute('aria-hidden', 'true');
-    preview.addEventListener('loadeddata', () => thumb.classList.add('has-preview'), { once: true });
-    preview.addEventListener('error', () => preview.remove(), { once: true });
-    thumb.appendChild(preview);
-  }
   thumb.appendChild(label);
-  if (shouldHydrateAudio) hydrateFileThumbnail(entry, thumb);
+  const wantsVideo = entry.type === 'file' && entry.isVideo && Boolean(mediaUrl);
+  const wantsAudio = shouldHydrateAudio && entry.isAudio;
+  if (wantsVideo || wantsAudio) {
+    const hydrate = () => {
+      if (!thumb.isConnected) return;
+      if (wantsVideo) hydrateVideoPreview(thumb, mediaUrl);
+      if (wantsAudio) hydrateFileThumbnail(entry, thumb);
+    };
+    const observer = thumbObserver();
+    if (observer) {
+      thumb._hydrate = hydrate;
+      observer.observe(thumb);
+    } else {
+      hydrate();
+    }
+  }
   return thumb;
 }
 
 function renderFileGrid(selector, entries, handlers) {
   const grid = $(selector);
   if (!grid) return;
+  if (state.thumbObserver) {
+    for (const thumb of grid.querySelectorAll('.file-thumb')) state.thumbObserver.unobserve(thumb);
+  }
   grid.innerHTML = '';
   if (!entries.length) {
     renderEmpty(grid, '目录为空');
     return;
   }
+  const fragment = document.createDocumentFragment();
   for (const entry of entries) {
     const mediaUrl = entryMediaUrl(entry);
     const isPlayableFile = entry.type === 'file' && (entry.isAudio || entry.isVideo || entry.isMedia);
@@ -1998,8 +2415,9 @@ function renderFileGrid(selector, entries, handlers) {
       setFileQueueButtonState(queueButton, isMediaEntryQueued(entry), false);
       wrap.appendChild(queueButton);
     }
-    grid.appendChild(wrap);
+    fragment.appendChild(wrap);
   }
+  grid.appendChild(fragment);
 }
 
 function parentPath(rel) {
@@ -3039,11 +3457,22 @@ async function loadAdminStorageList() {
     renderEmpty('#adminFileList', '暂无存储节点');
     return;
   }
-  $('#adminStorageStatus').textContent = '加载中';
-  const data = await api(`/api/admin/storage/nodes/${nodeId}/list?path=${encodeURIComponent(state.adminStoragePath)}`);
+  $('#adminStorageStatus').textContent = '';
+  renderFileSkeleton('#adminFileList');
+  let data;
+  try {
+    data = await api(`/api/admin/storage/nodes/${nodeId}/list?path=${encodeURIComponent(state.adminStoragePath)}`);
+  } catch (error) {
+    if (/不存在/.test(error.message) && state.adminStoragePath) {
+      state.adminStoragePath = parentPath(state.adminStoragePath);
+      return loadAdminStorageList();
+    }
+    renderEmpty('#adminFileList', '无法读取目录');
+    throw error;
+  }
   $('#adminStoragePath').textContent = `/${data.path || ''}`;
   if ($('#downloadPath')) $('#downloadPath').placeholder = `/${data.path || ''}`;
-  $('#adminStorageStatus').textContent = `${data.entries?.length || 0} 项`;
+  $('#adminStorageStatus').textContent = data.entries?.length ? '' : '目录为空，点击文件可删除';
   renderFileGrid('#adminFileList', data.entries || [], {
     onDir: (entry) => {
       state.adminStoragePath = entry.path;
@@ -3125,10 +3554,7 @@ function bindEvents() {
         });
       });
       if (!data) return;
-      showAuthenticated(data.user);
-      await loadConfig();
-      await loadRooms();
-      switchView('lobby');
+      await enterApp(data.user);
     } catch (error) {
       $('#authMessage').textContent = error.message;
     }
@@ -3136,11 +3562,13 @@ function bindEvents() {
   $('#logoutBtn').addEventListener('click', async () => {
     await api('/api/auth/logout', { method: 'POST' });
     state.roomSession = null;
+    clearTimeout(state.reconnectTimer);
     stopLatencyMonitor();
     if (state.ws) {
       state.ws._manualClose = true;
       state.ws.close();
     }
+    setSyncConnection('idle');
     showLoggedOut();
   });
   document.querySelector('[data-action="home"]').addEventListener('click', () => {
@@ -3197,15 +3625,15 @@ function bindEvents() {
       markLocalSeekIntent(LOCAL_SEEK_LOCK_MS);
       state.bufferingLocally = false;
       setPlaybackRate(1);
-      clearCatchupStatus(0);
-      setBufferStatus('正在定位', 'warn');
+      clearCatchupStatus();
+      setSyncMode('seeking');
     });
     state.artPlayer?.on?.('seek', (currentTime, requestedTime) => {
       if (hasProgrammaticSeekIntent()) return;
       rememberLocalSeekTarget(Number.isFinite(Number(requestedTime)) ? requestedTime : currentTime);
       markLocalSeekIntent(LOCAL_SEEK_LOCK_MS);
       setPlaybackRate(1);
-      setBufferStatus('正在定位', 'warn');
+      setSyncMode('seeking');
       clearTimeout(state.seekCommitTimer);
       state.seekCommitTimer = setTimeout(() => commitLocalSeek('seek', { force: true }), 180);
     });
@@ -3213,7 +3641,7 @@ function bindEvents() {
       ensureVideoVisible();
       clearTimeout(state.pendingPauseTimer);
       markLocalPlay();
-      setBufferStatus('播放中', 'good');
+      settleSyncMode();
       if (Date.now() > state.suppressUntil) commitLocalPlay('play');
       renderPlaybackControls();
     });
@@ -3245,7 +3673,7 @@ function bindEvents() {
     for (const eventName of ['waiting', 'stalled', 'suspend']) {
       bindPlayerEvent(eventName, () => {
         if (hasLocalSeekIntent()) {
-          setBufferStatus('定位缓冲中', 'warn');
+          setSyncMode('seeking');
           return;
         }
         if (state.latestRemoteState?.isPlaying || hasLocalPlayIntent()) scheduleCatchup('本地缓冲');
@@ -3261,14 +3689,17 @@ function bindEvents() {
       };
       state.sourceLoading = false;
       state.pendingAutoplay = false;
-      setBufferStatus(labels[code] || '视频加载失败', 'bad');
+      setSyncMode('error', labels[code] || '视频无法加载');
+    });
+    bindPlayerEvent('durationchange', () => {
+      if (state.currentMediaType === 'video') reportCurrentTrackDuration();
     });
     for (const eventName of ['loadedmetadata', 'loadeddata', 'canplay', 'canplaythrough', 'playing', 'progress']) {
       bindPlayerEvent(eventName, () => {
         ensureVideoVisible();
         finishSourcePreload();
         if (state.bufferingLocally) runCatchup();
-        else if (state.currentMediaUrl && player.readyState >= 3) setBufferStatus('缓存可播放', 'good');
+        else if (eventName === 'playing' || (state.currentMediaUrl && player.readyState >= 3 && state.sync.mode === 'loading')) settleSyncMode();
       });
     }
     bindPlayerEvent('seeked', () => {
@@ -3280,7 +3711,7 @@ function bindEvents() {
       }, 140);
     });
     bindPlayerEvent('ended', () => {
-      if (state.currentMediaType === 'video') sendQueueMessage('queue_next', { mediaType: 'video', ended: true });
+      if (state.currentMediaType === 'video') sendQueueMessage('queue_next', { mediaType: 'video', ended: true, trackId: state.currentTrackId });
     });
   }
   const audioPlayer = getAudioMedia();
@@ -3310,14 +3741,14 @@ function bindEvents() {
       markLocalSeekIntent(LOCAL_SEEK_LOCK_MS);
       state.bufferingLocally = false;
       setPlaybackRate(1);
-      clearCatchupStatus(0);
-      setBufferStatus('正在定位', 'warn');
+      clearCatchupStatus();
+      setSyncMode('seeking');
     });
     bindAudioEvent('play', () => {
       if (state.currentMediaType !== 'audio') return;
       clearTimeout(state.pendingPauseTimer);
       markLocalPlay();
-      setBufferStatus('播放中', 'good');
+      settleSyncMode();
       if (Date.now() > state.suppressUntil) commitLocalPlay('play');
       updateMusicProgressUi();
       renderMediaQueue();
@@ -3355,7 +3786,7 @@ function bindEvents() {
       bindAudioEvent(eventName, () => {
         if (state.currentMediaType !== 'audio') return;
         if (hasLocalSeekIntent()) {
-          setBufferStatus('定位缓冲中', 'warn');
+          setSyncMode('seeking');
           return;
         }
         if (state.latestRemoteState?.isPlaying || hasLocalPlayIntent()) scheduleCatchup('本地缓冲');
@@ -3365,7 +3796,7 @@ function bindEvents() {
       if (state.currentMediaType !== 'audio') return;
       state.sourceLoading = false;
       state.pendingAutoplay = false;
-      setBufferStatus('浏览器不支持此音频格式或加载失败', 'bad');
+      setSyncMode('error', '音频无法播放');
     });
     for (const eventName of ['loadedmetadata', 'loadeddata', 'canplay', 'canplaythrough', 'playing', 'progress']) {
       bindAudioEvent(eventName, () => {
@@ -3374,10 +3805,13 @@ function bindEvents() {
         updateMusicProgressUi();
         if (eventName === 'playing') renderMediaQueue();
         if (state.bufferingLocally) runCatchup();
-        else if (state.currentMediaUrl && audioPlayer.readyState >= 3) setBufferStatus('缓存可播放', 'good');
+        else if (eventName === 'playing' || (state.currentMediaUrl && audioPlayer.readyState >= 3 && state.sync.mode === 'loading')) settleSyncMode();
       });
     }
     bindAudioEvent('timeupdate', updateMusicProgressUi);
+    bindAudioEvent('durationchange', () => {
+      if (state.currentMediaType === 'audio') reportCurrentTrackDuration();
+    });
     bindAudioEvent('seeked', () => {
       if (state.currentMediaType !== 'audio' || hasProgrammaticSeekIntent()) return;
       markLocalSeekIntent(LOCAL_SEEK_COMMIT_LOCK_MS);
@@ -3386,7 +3820,7 @@ function bindEvents() {
       updateMusicProgressUi();
     });
     bindAudioEvent('ended', () => {
-      if (state.currentMediaType === 'audio') sendQueueMessage('queue_next', { mediaType: 'audio', ended: true });
+      if (state.currentMediaType === 'audio') sendQueueMessage('queue_next', { mediaType: 'audio', ended: true, trackId: state.currentTrackId });
     });
   }
   $('#switchVideoBtn').addEventListener('click', (event) => {
@@ -3409,14 +3843,27 @@ function bindEvents() {
   $('#roomModeVideoBtn')?.addEventListener('click', () => requestRoomMode('video'));
   $('#roomModeAudioBtn')?.addEventListener('click', () => requestRoomMode('audio'));
   $('#playBtn')?.addEventListener('click', (event) => toggleCurrentPlayback(event.currentTarget));
-  $('#musicPlayBtn')?.addEventListener('click', (event) => toggleCurrentPlayback(event.currentTarget));
-  $('#musicPrevBtn')?.addEventListener('click', (event) => {
-    triggerButtonFeedback(event.currentTarget, 'prev');
-    sendQueueMessage('queue_previous', { mediaType: 'audio' });
+  $('#syncNowBtn')?.addEventListener('click', () => syncNow());
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    resumeRoomConnectionIfNeeded();
+    // Background tabs throttle timers; re-align quietly if we drifted while hidden.
+    if (state.currentMediaUrl && state.desiredPlaying && state.latestRemoteState?.isPlaying) {
+      const drift = remoteProgressDrift();
+      if (Math.abs(drift) > PROGRESS_SYNC_THRESHOLD_SECONDS) alignToRoom();
+    }
   });
-  $('#musicNextBtn')?.addEventListener('click', (event) => {
-    triggerButtonFeedback(event.currentTarget, 'next');
-    sendQueueMessage('queue_next', { mediaType: 'audio' });
+  window.addEventListener('online', resumeRoomConnectionIfNeeded);
+  window.addEventListener('hashchange', () => {
+    if (state.ignoreNextHashChange) {
+      state.ignoreNextHashChange = false;
+      return;
+    }
+    if (!state.user) return;
+    const roomId = roomIdFromHash();
+    if (roomId && roomId !== state.currentRoom?.id) joinRoom(roomId).catch((error) => toast(error.message));
+    else if (roomId && state.currentRoom) switchView('room');
+    else if (!roomId && !$('#roomView').classList.contains('hidden')) switchView('lobby');
   });
   $('#mediaPrevQueueBtn')?.addEventListener('click', (event) => {
     triggerButtonFeedback(event.currentTarget, 'prev');
@@ -3698,6 +4145,24 @@ function bindEvents() {
   });
 }
 
+async function enterApp(user) {
+  showAuthenticated(user);
+  updateRoomTab();
+  await loadConfig();
+  await loadRooms();
+  const roomId = roomIdFromHash();
+  if (roomId) {
+    try {
+      await joinRoom(roomId);
+      return;
+    } catch (error) {
+      toast(error.message);
+      setRoomHash('');
+    }
+  }
+  switchView('lobby');
+}
+
 async function init() {
   bindEvents();
   setAuthMode('login');
@@ -3705,15 +4170,14 @@ async function init() {
   updateInstallSslFields();
   updateNodeConfigSslFields();
   switchAdminPage('sync');
+  renderSyncBar();
   try {
     const data = await api('/api/me');
     if (!data.user) return showLoggedOut();
-    showAuthenticated(data.user);
-    await loadConfig();
-    await loadRooms();
-    switchView('lobby');
-  } catch {
-    showLoggedOut();
+    await enterApp(data.user);
+  } catch (error) {
+    if (state.user) toast(error.message);
+    else showLoggedOut();
   }
 }
 

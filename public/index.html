@@ -2,18 +2,19 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Video Together</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#faf9f5">
+  <title>PlayTogether</title>
   <link rel="icon" type="image/webp" href="/material/xiuzhen.webp?v=20260513-icon1">
-    <link rel="stylesheet" href="/styles.css?v=20260520-storageui2">
+  <link rel="stylesheet" href="/styles.css?v=20260904-sync1">
   <script src="/vendor/artplayer.js"></script>
   <script src="/vendor/hls.js"></script>
-    <script defer src="/app.js?v=20260520-cover2"></script>
+  <script defer src="/app.js?v=20260904-sync1"></script>
 </head>
 <body>
   <nav class="global-nav">
     <div class="nav-inner">
-      <button class="brand-button" type="button" data-action="home" aria-label="返回大厅">Video Together</button>
+      <button class="brand-button" type="button" data-action="home" aria-label="返回大厅">PlayTogether</button>
       <div class="nav-actions">
         <span id="currentUser" class="nav-user"></span>
         <button id="logoutBtn" class="dark-utility hidden" type="button">退出</button>
@@ -23,9 +24,8 @@
 
   <section id="authView" class="auth-screen">
     <div class="auth-copy">
-      <p class="eyebrow">Watch Room</p>
       <h1>一起看。</h1>
-      <p>同步播放、聊天和弹幕。</p>
+      <p>同步播放 · 聊天 · 弹幕</p>
     </div>
     <div class="auth-panel">
       <div class="segmented" role="tablist" aria-label="登录或注册">
@@ -53,40 +53,18 @@
 
   <div id="appView" class="hidden">
     <header class="sub-nav">
-      <div>
-        <p class="eyebrow">Lobby</p>
-        <h2 id="surfaceTitle">房间大厅</h2>
-      </div>
+      <h2 id="surfaceTitle">大厅</h2>
       <div class="tab-row">
         <button class="tab-button active" data-view="lobby" type="button">大厅</button>
-        <button class="tab-button" data-view="room" type="button">房间</button>
+        <button id="roomTab" class="tab-button" data-view="room" type="button" disabled>房间</button>
         <button id="adminTab" class="tab-button hidden" data-view="admin" type="button">后台</button>
       </div>
     </header>
 
     <main>
-      <section id="lobbyView" class="surface light-surface">
-        <div class="status-grid">
-          <div class="metric-tile">
-            <span>房间</span>
-            <strong id="metricRooms">0</strong>
-          </div>
-          <div class="metric-tile">
-            <span>sync node</span>
-            <strong id="metricSyncNodes">0</strong>
-          </div>
-          <div class="metric-tile">
-            <span>存储节点</span>
-            <strong id="metricStorageNodes">0</strong>
-          </div>
-          <div class="metric-tile">
-            <span>安装任务</span>
-            <strong id="metricInstallJobs">0</strong>
-          </div>
-        </div>
+      <section id="lobbyView" class="surface">
         <div class="content-grid">
           <form id="createRoomForm" class="utility-card form-stack featured-card">
-            <div class="card-kicker">New room</div>
             <h3>创建房间</h3>
             <label>
               <span>房间名</span>
@@ -96,11 +74,11 @@
               <span>sync node</span>
               <select id="roomSyncNode"></select>
             </label>
-            <button class="primary-pill" type="submit">创建</button>
+            <button class="primary-pill" type="submit">创建并进入</button>
           </form>
           <div class="utility-card room-list-card">
             <div class="section-head">
-              <h3>房间</h3>
+              <h3>房间 <span id="roomCount" class="count-badge">0</span></h3>
               <button id="refreshRoomsBtn" class="secondary-pill" type="button">刷新</button>
             </div>
             <div id="roomList" class="list-stack"></div>
@@ -111,89 +89,92 @@
       <section id="roomView" class="surface room-surface hidden">
         <div class="room-layout">
           <div class="player-column">
-            <div class="room-mode-card">
-              <div class="segmented room-mode-switch" role="tablist" aria-label="房间模式">
-                <button id="roomModeVideoBtn" class="segment active" data-room-mode="video" type="button">视频</button>
-                <button id="roomModeAudioBtn" class="segment" data-room-mode="audio" type="button">音乐</button>
-              </div>
-            </div>
-            <div class="player-shell">
-              <div id="artPlayerMount" class="art-player-mount"></div>
-              <div id="danmakuLayer" class="danmaku-layer"></div>
-            </div>
-            <div id="musicPanel" class="music-panel hidden" aria-live="polite">
-              <div class="music-now">
-                <div id="musicCover" class="music-cover"></div>
-                <div class="music-info">
-                  <p class="eyebrow">Now Playing</p>
-                  <h3 id="musicTitle">未选择音乐</h3>
-                  <p id="musicArtist">从媒体库或直链添加歌曲</p>
+            <div class="stage">
+              <div class="stage-head">
+                <div class="segmented room-mode-switch" role="tablist" aria-label="房间模式">
+                  <button id="roomModeVideoBtn" class="segment active" data-room-mode="video" type="button">视频</button>
+                  <button id="roomModeAudioBtn" class="segment" data-room-mode="audio" type="button">音乐</button>
+                </div>
+                <div id="syncBar" class="sync-bar" data-connection="idle" data-mode="idle" aria-live="polite">
+                  <span id="syncDot" class="sync-dot" aria-hidden="true"></span>
+                  <span id="syncLabel" class="sync-label">未连接</span>
+                  <span id="syncDetail" class="sync-detail"></span>
+                  <span id="syncNotice" class="sync-notice" aria-live="polite"></span>
+                  <button id="syncNowBtn" class="sync-button" type="button" title="对齐到房间进度">同步</button>
                 </div>
               </div>
-              <audio id="audioPlayer" preload="auto"></audio>
-              <div class="music-progress-row">
-                <span id="musicCurrentTime">0:00</span>
-                <div class="music-wave-progress">
-                  <svg class="music-wave-svg" viewBox="0 0 320 34" preserveAspectRatio="none" aria-hidden="true" focusable="false">
-                    <path class="music-wave-rest-line" d="M0 17 L320 17"></path>
-                    <path class="music-wave-played-line" d=""></path>
-                    <circle class="music-wave-thumb-dot" cx="0" cy="17" r="5.5"></circle>
-                  </svg>
-                  <input id="musicProgress" type="range" min="0" max="1000" value="0" step="1" aria-label="音乐进度">
+              <div class="player-shell is-empty">
+                <div id="artPlayerMount" class="art-player-mount"></div>
+                <div id="danmakuLayer" class="danmaku-layer"></div>
+                <div class="stage-empty" aria-hidden="true"><span>从媒体库选择要一起看的内容</span></div>
+              </div>
+              <div id="musicPanel" class="music-panel hidden" aria-live="polite">
+                <div class="music-now">
+                  <div id="musicCover" class="music-cover"></div>
+                  <div class="music-info">
+                    <h3 id="musicTitle">未选择音乐</h3>
+                    <p id="musicArtist"></p>
+                  </div>
                 </div>
-                <span id="musicDuration">0:00</span>
+                <audio id="audioPlayer" preload="auto"></audio>
+                <div class="music-progress-row">
+                  <span id="musicCurrentTime">0:00</span>
+                  <div class="music-wave-progress">
+                    <svg class="music-wave-svg" viewBox="0 0 320 34" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+                      <path class="music-wave-rest-line" d="M0 17 L320 17"></path>
+                      <path class="music-wave-played-line" d=""></path>
+                      <circle class="music-wave-thumb-dot" cx="0" cy="17" r="5.5"></circle>
+                    </svg>
+                    <input id="musicProgress" type="range" min="0" max="1000" value="0" step="1" aria-label="音乐进度">
+                  </div>
+                  <span id="musicDuration">0:00</span>
+                </div>
+                <div id="musicLyrics" class="music-lyrics hidden" aria-live="polite">
+                  <div id="musicLyricsCurrent" class="music-lyrics-current"></div>
+                  <div id="musicLyricsNext" class="music-lyrics-next"></div>
+                </div>
               </div>
-              <div id="musicLyrics" class="music-lyrics hidden" aria-live="polite">
-                <div id="musicLyricsCurrent" class="music-lyrics-current"></div>
-                <div id="musicLyricsNext" class="music-lyrics-next"></div>
-              </div>
-              <div class="music-controls">
-                <button id="musicPrevBtn" class="secondary-pill icon-button" type="button" aria-label="上一首" title="上一首"><span class="button-icon icon-previous" aria-hidden="true"></span></button>
-                <button id="musicPlayBtn" class="secondary-pill icon-button play-toggle-button is-paused" type="button" aria-label="播放/暂停" title="播放/暂停"><span class="button-icon icon-pause" aria-hidden="true"></span></button>
-                <button id="musicNextBtn" class="secondary-pill icon-button" type="button" aria-label="下一首" title="下一首"><span class="button-icon icon-next" aria-hidden="true"></span></button>
+              <div class="transport-deck">
+                <div class="transport-controls">
+                  <button id="mediaPrevQueueBtn" class="deck-button icon-button" type="button" aria-label="上一个" title="上一个"><span class="button-icon icon-previous" aria-hidden="true"></span></button>
+                  <button id="playBtn" class="deck-button icon-button play-toggle-button is-paused" type="button" aria-label="播放" title="播放"><span class="button-icon icon-play" aria-hidden="true"></span></button>
+                  <button id="mediaNextQueueBtn" class="deck-button icon-button" type="button" aria-label="下一个" title="下一个"><span class="button-icon icon-next" aria-hidden="true"></span></button>
+                </div>
+                <div id="nowPlayingLine" class="now-playing-line"></div>
               </div>
             </div>
-            <div class="transport-strip video-transport">
-              <button id="mediaPrevQueueBtn" class="secondary-pill icon-button" type="button" aria-label="上一集" title="上一集"><span class="button-icon icon-previous" aria-hidden="true"></span></button>
-              <button id="playBtn" class="secondary-pill icon-button play-toggle-button is-paused" type="button" aria-label="播放/暂停" title="播放/暂停"><span class="button-icon icon-pause" aria-hidden="true"></span></button>
-              <button id="mediaNextQueueBtn" class="secondary-pill icon-button" type="button" aria-label="下一集" title="下一集"><span class="button-icon icon-next" aria-hidden="true"></span></button>
-            </div>
-            <div id="queuePanel" class="media-queue-panel">
+
+            <div id="queuePanel" class="panel media-queue-panel">
               <div class="section-head compact-head">
                 <h3 id="mediaQueueTitle">视频队列</h3>
                 <div class="section-actions">
-                  <button id="mediaClearQueueBtn" class="pearl-button" type="button">清空</button>
                   <select id="mediaPlaybackMode" class="compact-select" aria-label="队列播放模式">
-                    <option value="sequence">顺序播放</option>
-                    <option value="random">随机播放</option>
+                    <option value="sequence">顺序</option>
+                    <option value="random">随机</option>
                     <option value="repeat-one">单曲循环</option>
                   </select>
+                  <button id="mediaClearQueueBtn" class="pearl-button" type="button">清空</button>
                 </div>
               </div>
               <div id="mediaQueueList" class="media-queue-list"></div>
             </div>
-            <div class="room-meta">
-              <span id="roomNameLabel">未进入房间</span>
-              <span id="syncStatus" class="status-pill status-muted">未连接</span>
-              <span id="syncLatency" class="status-pill status-muted">同步延迟 -</span>
-              <span id="bufferStatus" class="status-pill status-muted">缓冲状态 -</span>
-            </div>
-            <div class="storage-browser">
-              <div class="section-head">
+
+            <div class="panel storage-browser">
+              <div class="section-head compact-head">
                 <h3>媒体库</h3>
                 <div class="section-actions">
-                  <button id="refreshStorageBrowserBtn" class="secondary-pill" type="button">刷新</button>
-                  <select id="storageNodeSelect"></select>
+                  <select id="storageNodeSelect" aria-label="存储节点"></select>
+                  <button id="refreshStorageBrowserBtn" class="pearl-button" type="button" aria-label="刷新" title="刷新">刷新</button>
                 </div>
               </div>
               <div class="path-row">
                 <button id="storageBackBtn" class="pearl-button" type="button">上级</button>
                 <span id="storagePathLabel">/</span>
               </div>
-              <p id="storageBrowserStatus" class="panel-note"></p>
+              <p id="storageBrowserStatus" class="panel-note hidden"></p>
               <div id="storageFileList" class="file-grid"></div>
               <details class="direct-link-menu">
-                <summary>直链播放</summary>
+                <summary>直链</summary>
                 <div class="control-strip">
                   <input id="videoUrlInput" class="url-input" placeholder="https://example.com/video.mp4">
                   <button id="addMediaQueueBtn" class="secondary-pill" type="button">加入队列</button>
@@ -202,16 +183,18 @@
               </details>
             </div>
           </div>
+
           <aside class="chat-column">
-            <div class="members-panel">
+            <div class="panel members-panel">
               <div class="section-head compact-head">
-                <h3>成员</h3>
-                <span id="memberCount" class="status-pill status-muted">0</span>
+                <h3>成员 <span id="memberCount" class="count-badge">0</span></h3>
               </div>
               <div id="memberList" class="chip-list"></div>
             </div>
-            <div class="chat-panel">
-              <h3>聊天</h3>
+            <div class="panel chat-panel">
+              <div class="section-head compact-head">
+                <h3>聊天</h3>
+              </div>
               <div id="chatMessages" class="chat-messages"></div>
               <div class="emoji-row">
                 <button type="button" data-emoji="😀">😀</button>
@@ -221,7 +204,7 @@
                 <button type="button" data-emoji="👍">👍</button>
               </div>
               <form id="chatForm" class="chat-form">
-                <input id="chatInput" maxlength="300" placeholder="发送消息">
+                <input id="chatInput" maxlength="300" placeholder="发送消息" autocomplete="off">
                 <button class="primary-pill" type="submit">发送</button>
               </form>
             </div>
@@ -235,8 +218,8 @@
             <button class="tab-button active" data-admin-page="sync" type="button">同步节点</button>
             <button class="tab-button" data-admin-page="storage" type="button">存储节点</button>
             <button class="tab-button" data-admin-page="dns" type="button">DNS</button>
-            <button class="tab-button" data-admin-page="users" type="button">用户管理</button>
-            <button class="tab-button" data-admin-page="rooms" type="button">房间管理</button>
+            <button class="tab-button" data-admin-page="users" type="button">用户</button>
+            <button class="tab-button" data-admin-page="rooms" type="button">房间</button>
           </div>
 
           <div class="admin-grid" data-admin-panel="sync">
@@ -287,7 +270,7 @@
                 <label data-ssl-mode="dns"><span>DNS 验证方式</span><select id="installDnsProvider"></select></label>
                 <label class="check-line" data-ssl-mode="dns"><input id="installDnsAutoRenew" type="checkbox" checked><span>DNS 验证自动续签</span></label>
                 <label data-ssl-mode="dns"><span>DNS API</span><input id="installSslDnsProvider" placeholder="dns_cf / dns_ali / dns_dp"></label>
-                <label class="wide" data-ssl-mode="dns"><span>DNS API 环境变量</span><textarea id="installSslDnsEnv" placeholder="CF_Token=...\nCF_Account_ID=..."></textarea></label>
+                <label class="wide" data-ssl-mode="dns"><span>DNS API 环境变量</span><textarea id="installSslDnsEnv" placeholder="CF_Token=...&#10;CF_Account_ID=..."></textarea></label>
                 <label class="wide" data-ssl-mode="manual"><span>SSL 证书 PEM</span><textarea id="installSslCert" placeholder="-----BEGIN CERTIFICATE-----"></textarea></label>
                 <label class="wide" data-ssl-mode="manual"><span>SSL 私钥 PEM</span><textarea id="installSslKey" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></label>
               </div>
@@ -298,7 +281,6 @@
               <label class="check-line"><input id="installMakeDefaultSync" type="checkbox"><span>安装后设为默认 sync node</span></label>
               <button class="primary-pill" type="submit">开始安装</button>
             </form>
-            <p class="panel-note">安装成功后会自动测试公开地址，并添加或更新对应节点。</p>
             <div id="installJobs" class="list-stack"></div>
             </div>
 
@@ -324,7 +306,7 @@
                 <label data-node-config-ssl-mode="dns"><span>DNS 验证方式</span><select id="nodeConfigDnsProvider"></select></label>
                 <label class="check-line" data-node-config-ssl-mode="dns"><input id="nodeConfigDnsAutoRenew" type="checkbox" checked><span>DNS 验证自动续签</span></label>
                 <label data-node-config-ssl-mode="dns"><span>DNS API</span><input id="nodeConfigSslDnsProvider" placeholder="dns_cf / dns_ali / dns_dp"></label>
-                <label class="wide" data-node-config-ssl-mode="dns"><span>DNS API 环境变量</span><textarea id="nodeConfigSslDnsEnv" placeholder="CF_Token=...\nCF_Account_ID=..."></textarea></label>
+                <label class="wide" data-node-config-ssl-mode="dns"><span>DNS API 环境变量</span><textarea id="nodeConfigSslDnsEnv" placeholder="CF_Token=...&#10;CF_Account_ID=..."></textarea></label>
                 <label class="wide" data-node-config-ssl-mode="manual"><span>SSL 证书 PEM</span><textarea id="nodeConfigSslCert" placeholder="留空则保留节点当前证书"></textarea></label>
                 <label class="wide" data-node-config-ssl-mode="manual"><span>SSL 私钥 PEM</span><textarea id="nodeConfigSslKey" placeholder="留空则保留节点当前私钥"></textarea></label>
               </div>
@@ -334,9 +316,8 @@
               <label class="check-line"><input id="nodeConfigUseStorage" type="checkbox"><span>启用存储</span></label>
               <label class="check-line"><input id="nodeConfigEnabled" type="checkbox" checked><span>启用节点</span></label>
               <label class="check-line"><input id="nodeConfigDefault" type="checkbox"><span>设为默认 sync node</span></label>
-              <button class="primary-pill" type="submit">保存并同步</button>
+              <button class="primary-pill" type="submit">保存并同步到远端</button>
             </form>
-            <p class="panel-note">保存后会更新后台节点信息，并通过 SSH 自动同步远端 .env、证书设置和节点服务配置。</p>
             </div>
 
             <div class="utility-card wide-card">
@@ -348,7 +329,6 @@
               <label class="wide"><span>已安装节点</span><select id="updateNodeSelect"></select></label>
               <button class="primary-pill" type="submit">更新节点程序</button>
             </form>
-            <p class="panel-note">会通过安装时保存的 SSH 信息自动上传新版 sync/storage 节点、安装依赖、重启并测试。</p>
             <div id="updateJobs" class="list-stack"></div>
             </div>
           </div>
@@ -404,7 +384,7 @@
               <label><span>存储节点</span><select id="downloadStorageSelect"></select></label>
               <label><span>保存目录</span><input id="downloadPath" placeholder="/"></label>
               <label class="wide"><span>直链 / 磁力</span><textarea id="downloadUrl" rows="3" placeholder="https://example.com/video.mp4 或 magnet:?xt=urn:btih:..."></textarea></label>
-              <label><span>文件名</span><input id="downloadFilename" placeholder="可选，直链下载时使用"></label>
+              <label><span>文件名</span><input id="downloadFilename" placeholder="可选"></label>
               <button class="primary-pill" type="submit">开始下载</button>
             </form>
             <div id="downloadTaskList" class="list-stack"></div>
@@ -446,7 +426,7 @@
           <div class="admin-grid hidden" data-admin-panel="users">
             <div class="utility-card wide-card">
               <div class="section-head">
-                <h3>用户管理</h3>
+                <h3>用户</h3>
               </div>
               <div id="adminUserList" class="list-stack"></div>
             </div>
@@ -455,7 +435,7 @@
           <div class="admin-grid hidden" data-admin-panel="rooms">
             <div class="utility-card wide-card">
               <div class="section-head">
-                <h3>房间管理</h3>
+                <h3>房间</h3>
               </div>
               <div id="adminRoomList" class="list-stack"></div>
             </div>
