@@ -1,13 +1,45 @@
 const $ = (selector) => document.querySelector(selector);
 
-const LOCAL_SEEK_LOCK_MS = 7000;
-const LOCAL_SEEK_COMMIT_LOCK_MS = 6500;
-// Drift policy: under SOFT the player counts as in sync; between SOFT and HARD the playback rate is
-// nudged so members converge without a visible jump; above HARD we seek to the room position.
-const SOFT_SYNC_THRESHOLD_SECONDS = 0.4;
-const NUDGE_RELEASE_THRESHOLD_SECONDS = 0.15;
-const PROGRESS_SYNC_THRESHOLD_SECONDS = 3;
-const NUDGE_RATE_MAX_DELTA = 0.2;
+// Local intent locks. With origin-based echo detection these only have to outlive the media
+// element's own event latency, not a whole network round trip.
+const LOCAL_SEEK_LOCK_MS = 2500;
+const LOCAL_SEEK_COMMIT_LOCK_MS = 2000;
+const LOCAL_PLAY_LOCK_MS = 2000;
+const EXPLICIT_PAUSE_LOCK_MS = 2000;
+const PROGRAMMATIC_SEEK_CAP_MS = 4000;
+const PROGRAMMATIC_PLAY_MS = 1500;
+// Drift policy. The room is a timeline (position + anchor in server time); the client samples its
+// own drift against it every SYNC_LOOP_MS, filters it, and nudges the playback rate inside
+// [soft, hard) or seeks beyond hard. Thresholds widen with measured network jitter so a noisy link
+// is not corrected into oscillation. Music gets a gentler rate cap because tempo wobble is more
+// audible than a small skip.
+const SYNC_LOOP_MS = 250;
+const SYNC_DRIFT_EMA_ALPHA = 0.3;
+const SYNC_HARD_CONFIRMATIONS = 2;
+const SYNC_HARD_SEEK_COOLDOWN_MS = 2000;
+const SYNC_SCHEDULED_MIN_LEAD_MS = 50;
+const SYNC_STARVED_BUFFER_SECONDS = 1.5;
+const CATCHUP_SEEK_SECONDS = 0.75;
+const STALL_WINDOW_MS = 30000;
+const STALL_DEGRADED_COUNT = 3;
+const STALL_DEGRADED_HARD_SECONDS = 5;
+const SYNC_THRESHOLDS = {
+  video: { softBase: 0.25, softMax: 0.6, hardBase: 2.0, hardMax: 3.5, hardJitterGain: 4, capNear: 0.10, capFar: 0.20 },
+  audio: { softBase: 0.30, softMax: 0.6, hardBase: 2.0, hardMax: 2.0, hardJitterGain: 0, capNear: 0.08, capFar: 0.08 }
+};
+// Clock estimator: a burst of pings locks the offset in well under a second, then a cadence that
+// stays quick while the estimate is young or the link is jittery.
+const CLOCK_SAMPLE_MAX = 12;
+const CLOCK_SAMPLE_MAX_AGE_MS = 60000;
+const CLOCK_READY_SAMPLES = 3;
+const CLOCK_BURST_COUNT = 4;
+const CLOCK_BURST_INTERVAL_MS = 150;
+const CLOCK_PING_INTERVAL_MS = 3000;
+const CLOCK_FAST_PING_INTERVAL_MS = 1500;
+const CLOCK_FAST_WINDOW_MS = 20000;
+const CLOCK_JITTER_FAST_MS = 60;
+const CLOCK_STEP_MS = 200;
+const CLOCK_RESET_OFFSET_MS = 500;
 const RECONNECT_MAX_DELAY_MS = 15000;
 const SYNC_NOTICE_MS = 3200;
 const CHAT_DOM_LIMIT = 200;
@@ -43,7 +75,17 @@ const state = {
   reconnectTimer: null,
   reconnectAttempts: 0,
   latencyTimer: null,
+  clockBurstTimer: null,
+  clockStartedAt: 0,
   latencyPending: new Map(),
+  connectionId: '',
+  programmaticPlayUntil: 0,
+  scheduledStart: null,
+  stallTimes: [],
+  stallStartedAt: 0,
+  stallReportTimer: null,
+  memberStatusSent: 'playing',
+  syncLoopLastRender: '',
   suppressUntil: 0,
   mediaIntentUntil: 0,
   explicitPauseUntil: 0,
@@ -51,6 +93,7 @@ const state = {
   seekIntentUntil: 0,
   localSeekUntil: 0,
   programmaticSeekUntil: 0,
+  programmaticSeekTarget: null,
   pendingLocalSeekTarget: null,
   seekCommitTimer: null,
   pendingPauseTimer: null,
@@ -82,9 +125,12 @@ const state = {
     modeDetail: '',
     latencyMs: null,
     drift: 0,
+    driftFiltered: 0,
+    hardStreak: 0,
+    lastHardSeekAt: 0,
     nudgeRate: 1,
     clockOffset: 0,
-    clockSamples: [],
+    clock: { offset: 0, rtt: null, minRtt: null, jitter: 0, ready: false, samples: [], wallBase: 0, nodeKey: '' },
     noticeTimer: null
   },
   storagePath: '',
@@ -240,6 +286,7 @@ const SYNC_CONNECTION_LABELS = {
 const SYNC_MODE_LABELS = {
   idle: '已连接',
   loading: '加载中',
+  scheduled: '即将开始',
   synced: '已同步',
   nudging: '微调中',
   catching: '追赶中',
@@ -252,6 +299,7 @@ const SYNC_MODE_LABELS = {
 
 const SYNC_MODE_TONES = {
   idle: 'muted',
+  scheduled: 'good',
   synced: 'good',
   nudging: 'good',
   ready: 'good',
@@ -288,6 +336,7 @@ function settleSyncMode() {
   let mode;
   if (!state.currentMediaUrl) mode = 'idle';
   else if (state.sourceLoading) mode = 'loading';
+  else if (state.scheduledStart) mode = 'scheduled';
   else if (state.bufferingLocally) mode = current === 'buffering' ? 'buffering' : 'catching';
   else if (hasLocalSeekIntent() || media?.seeking) mode = 'seeking';
   else if (!media || media.paused) mode = current === 'error' || current === 'ready' ? current : 'paused';
@@ -303,6 +352,7 @@ function syncActionVerb(reason, remote, mediaChanged) {
     return title ? `播放《${title}》` : '切换了媒体';
   }
   if (reason === 'queue_end') return '播完了队列';
+  if (reason === 'queue_update') return '';
   if (reason === 'play') return '开始播放';
   if (reason === 'pause') return '暂停了';
   if (reason === 'seek') return `跳到 ${formatClock(remote?.position || 0)}`;
@@ -343,8 +393,12 @@ function renderSyncBar() {
     tone = SYNC_MODE_TONES[mode] || 'warn';
   }
   const details = [];
-  if (online && Number.isFinite(sync.latencyMs)) details.push(`${sync.latencyMs}ms`);
-  if (online && hasMedia && state.desiredPlaying && Math.abs(sync.drift) >= SOFT_SYNC_THRESHOLD_SECONDS) {
+  const thresholds = syncThresholds();
+  if (online && Number.isFinite(sync.latencyMs)) {
+    const jitter = Math.round(sync.clock?.jitter || 0);
+    details.push(jitter > CLOCK_JITTER_FAST_MS ? `${sync.latencyMs}ms · 抖动 ${jitter}ms` : `${sync.latencyMs}ms`);
+  }
+  if (online && hasMedia && state.desiredPlaying && Math.abs(sync.drift) >= thresholds.soft) {
     details.push(sync.drift > 0 ? `落后 ${sync.drift.toFixed(1)}s` : `领先 ${Math.abs(sync.drift).toFixed(1)}s`);
   }
   if (sync.modeDetail) details.push(sync.modeDetail);
@@ -358,7 +412,7 @@ function renderSyncBar() {
     const needsReconnect = ['failed', 'offline', 'reconnecting'].includes(sync.connection);
     const outOfSync = online && hasMedia && (
       ['catching', 'buffering', 'error', 'ready'].includes(sync.mode)
-      || (state.desiredPlaying && Math.abs(sync.drift) >= PROGRESS_SYNC_THRESHOLD_SECONDS)
+      || (state.desiredPlaying && Math.abs(sync.drift) >= thresholds.hard)
     );
     button.textContent = needsReconnect ? '重连' : '同步';
     button.classList.toggle('is-attention', needsReconnect || outOfSync);
@@ -381,6 +435,13 @@ function alignToRoom() {
   clearTimeout(state.seekCommitTimer);
   clearTimeout(state.pendingPauseTimer);
   state.desiredPlaying = Boolean(remote.isPlaying);
+  resetDriftFilter();
+  // A start that is still scheduled is honoured, not pre-empted.
+  if (isScheduled(remote)) {
+    clearScheduledStart();
+    armScheduledStart(remote);
+    return true;
+  }
   const target = remoteTargetPosition(remote);
   if (state.sourceLoading) {
     setPendingSeek(target);
@@ -489,8 +550,7 @@ function toggleCurrentPlayback(button) {
     commitLocalPause('pause');
     suppressLocalMediaEvents(500);
     pauseMedia();
-  } else {
-    commitLocalPlay('play');
+  } else if (!commitLocalPlay('play')) {
     suppressLocalMediaEvents(500);
     playMedia().catch(() => scheduleCatchup('等待播放'));
   }
@@ -752,8 +812,15 @@ function connectSync(data) {
   stopLatencyMonitor();
   state.roomSession = data;
   state.reconnectAttempts = 0;
-  state.sync.clockOffset = 0;
-  state.sync.clockSamples = [];
+  // The clock offset is a property of the node, not of the socket: keep it across reconnects and
+  // only start over when the room lives on a different node.
+  const nodeKey = data.syncNode?.wsUrl || data.syncNode?.id || '';
+  if (state.sync.clock.nodeKey !== nodeKey) {
+    resetClock();
+    state.sync.clock.offset = 0;
+    state.sync.clockOffset = 0;
+    state.sync.clock.nodeKey = nodeKey;
+  }
   openRoomSocket(data);
 }
 
@@ -774,10 +841,14 @@ function openRoomSocket(data) {
     setSyncConnection('online');
     settleSyncMode();
     startLatencyMonitor();
+    startSyncLoop();
   });
   ws.addEventListener('close', () => {
     if (state.ws !== ws) return;
     stopLatencyMonitor();
+    stopSyncLoop();
+    clearScheduledStart();
+    state.memberStatusSent = 'playing';
     state.ws = null;
     if (ws._manualClose || !state.roomSession) {
       setSyncConnection('offline');
@@ -799,13 +870,14 @@ function openRoomSocket(data) {
       return;
     }
     if (message.type === 'snapshot') {
+      state.connectionId = String(message.connectionId || '');
       renderMembers(message.members || []);
       renderMessages(message.messages || []);
       applyRemoteState(message.state, 'snapshot');
       return;
     }
     if (message.type === 'members') renderMembers(message.members || []);
-    else if (message.type === 'state' || message.type === 'state_sync') applyRemoteState(message.state, message.reason || message.type);
+    else if (message.type === 'state' || message.type === 'state_sync') applyRemoteState(message.state, message.reason || message.type, message.origin || '');
     else if (message.type === 'chat') {
       appendChat(message.message);
       showDanmaku(message.message);
@@ -824,13 +896,30 @@ function resumeRoomConnectionIfNeeded() {
 
 function startLatencyMonitor() {
   stopLatencyMonitor(false);
-  sendLatencyPing();
-  state.latencyTimer = setInterval(sendLatencyPing, 3000);
+  state.clockStartedAt = performance.now();
+  let burst = 0;
+  const fire = () => {
+    sendLatencyPing();
+    burst += 1;
+    if (burst < CLOCK_BURST_COUNT) state.clockBurstTimer = setTimeout(fire, CLOCK_BURST_INTERVAL_MS);
+  };
+  fire();
+  const schedule = () => {
+    const young = performance.now() - state.clockStartedAt < CLOCK_FAST_WINDOW_MS;
+    const jittery = (state.sync.clock.jitter || 0) > CLOCK_JITTER_FAST_MS;
+    state.latencyTimer = setTimeout(() => {
+      sendLatencyPing();
+      schedule();
+    }, young || jittery ? CLOCK_FAST_PING_INTERVAL_MS : CLOCK_PING_INTERVAL_MS);
+  };
+  schedule();
 }
 
 function stopLatencyMonitor(clearDisplay = true) {
-  clearInterval(state.latencyTimer);
+  clearTimeout(state.latencyTimer);
+  clearTimeout(state.clockBurstTimer);
   state.latencyTimer = null;
+  state.clockBurstTimer = null;
   state.latencyPending.clear();
   if (clearDisplay) setSyncLatency(null);
 }
@@ -838,46 +927,73 @@ function stopLatencyMonitor(clearDisplay = true) {
 function sendLatencyPing() {
   if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
   const id = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
-  state.latencyPending.set(id, performance.now());
+  state.latencyPending.set(id, { startedAt: performance.now(), sentAt: Date.now() });
   try {
-    state.ws.send(JSON.stringify({ type: 'latency_ping', id, clientTime: Date.now() }));
+    // The last measured RTT rides along so the node can size the scheduled-start lead.
+    state.ws.send(JSON.stringify({ type: 'latency_ping', id, clientTime: Date.now(), rtt: state.sync.clock.rtt }));
   } catch {
     state.latencyPending.delete(id);
   }
-  setTimeout(() => {
-    if (state.latencyPending.has(id)) {
-      state.latencyPending.delete(id);
-      setSyncLatency(null);
-    }
-  }, 5000);
+  setTimeout(() => state.latencyPending.delete(id), 5000);
+}
+
+function median(values) {
+  if (!values.length) return 0;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function resetClock() {
+  const clock = state.sync.clock;
+  clock.samples = [];
+  clock.ready = false;
+  clock.minRtt = null;
+  clock.rtt = null;
+  clock.jitter = 0;
 }
 
 // The room position is extrapolated from the node's clock, so every member needs to know how far
-// its own clock is from the node's. Otherwise clock skew between machines shows up as drift and
-// members end up "in sync" with themselves but seconds apart from each other.
+// its own clock is from the node's. Samples are accepted only when their RTT is close to the best
+// seen (a slow round trip carries an unreliable offset), the offset is the median of those, and
+// jitter is the spread of all RTTs — it widens the drift thresholds on a noisy link.
 function updateClockOffset(offset, rtt) {
-  const samples = state.sync.clockSamples;
-  samples.push({ offset, rtt });
-  if (samples.length > 8) samples.shift();
-  const best = samples.slice().sort((a, b) => a.rtt - b.rtt).slice(0, 3);
-  state.sync.clockOffset = best.reduce((sum, sample) => sum + sample.offset, 0) / best.length;
+  const clock = state.sync.clock;
+  const nowPerf = performance.now();
+  const wallBase = Date.now() - nowPerf;
+  // A wall-clock step (NTP adjustment, sleep/wake) invalidates every earlier sample.
+  if (clock.wallBase && Math.abs(wallBase - clock.wallBase) > CLOCK_STEP_MS) resetClock();
+  clock.wallBase = wallBase;
+  // A fresh, fast sample far from the retained estimate means the node's clock is not the one we
+  // remembered (different machine behind the same URL, or a stepped clock): start over.
+  if (clock.samples.length && Math.abs(offset - clock.offset) > CLOCK_RESET_OFFSET_MS && rtt <= (clock.minRtt || rtt) + 100) resetClock();
+  clock.samples.push({ offset, rtt, at: nowPerf });
+  clock.samples = clock.samples.filter((sample) => nowPerf - sample.at <= CLOCK_SAMPLE_MAX_AGE_MS).slice(-CLOCK_SAMPLE_MAX);
+  const rtts = clock.samples.map((sample) => sample.rtt);
+  const minRtt = Math.min(...rtts);
+  const accepted = clock.samples.filter((sample) => sample.rtt <= minRtt + Math.max(40, 0.5 * minRtt));
+  clock.offset = median(accepted.map((sample) => sample.offset));
+  clock.minRtt = minRtt;
+  clock.rtt = median(accepted.map((sample) => sample.rtt));
+  const medianRtt = median(rtts);
+  clock.jitter = median(rtts.map((value) => Math.abs(value - medianRtt)));
+  clock.ready = accepted.length >= CLOCK_READY_SAMPLES;
+  state.sync.clockOffset = clock.offset;
+  setSyncLatency(clock.rtt);
 }
 
 function serverNow() {
-  return Date.now() + (state.sync.clockOffset || 0);
+  return Date.now() + (state.sync.clock.offset || 0);
 }
 
 function handleLatencyPong(message) {
-  const startedAt = state.latencyPending.get(message.id);
-  if (!startedAt) return;
+  const pending = state.latencyPending.get(message.id);
+  if (!pending) return;
   state.latencyPending.delete(message.id);
-  const rtt = performance.now() - startedAt;
-  setSyncLatency(rtt);
+  const rtt = performance.now() - pending.startedAt;
   const serverTime = Number(message.serverTime);
-  const clientTime = Number(message.clientTime);
-  if (Number.isFinite(serverTime) && Number.isFinite(clientTime)) {
-    updateClockOffset(serverTime - (clientTime + rtt / 2), rtt);
-  }
+  const sentAt = Number.isFinite(Number(message.clientTime)) ? Number(message.clientTime) : pending.sentAt;
+  if (Number.isFinite(serverTime)) updateClockOffset(serverTime - (sentAt + Date.now()) / 2, rtt);
 }
 
 function prepareMediaElement(media) {
@@ -1015,12 +1131,19 @@ function getMediaEnded() {
   return Boolean(media?.ended);
 }
 
+// Every programmatic play goes through here, so the resulting `play` event can be told apart from
+// one the user caused; only the latter is ever committed to the room.
 function playMedia() {
   const media = getMedia();
   const art = state.currentMediaType === 'video' ? state.artPlayer || getPlayerCore() : null;
   if (!art?.play && !media?.play) return Promise.resolve();
+  state.programmaticPlayUntil = Date.now() + PROGRAMMATIC_PLAY_MS;
   const result = art?.play ? art.play() : media.play();
   return result?.catch ? result : Promise.resolve();
+}
+
+function hasProgrammaticPlay() {
+  return Date.now() <= state.programmaticPlayUntil;
 }
 
 function pauseMedia() {
@@ -1044,19 +1167,224 @@ function setPlaybackRate(rate) {
   } catch {}
 }
 
-// Gentle convergence: speed up or slow down by up to 20% so a member a second or two off drifts
-// back into step within a few seconds, without the jump cut a seek would cause. Nudging starts
-// past SOFT and only releases once well inside it, so the rate does not flap around the edge.
+function noteStall() {
+  const nowMs = Date.now();
+  state.stallTimes = state.stallTimes.filter((at) => nowMs - at < STALL_WINDOW_MS);
+  state.stallTimes.push(nowMs);
+}
+
+// A link that stalls repeatedly is not helped by seeking (every seek lands on unbuffered data and
+// stalls again); such a member converges by rate nudging alone until the link settles.
+function isDegradedLink() {
+  const nowMs = Date.now();
+  state.stallTimes = state.stallTimes.filter((at) => nowMs - at < STALL_WINDOW_MS);
+  return state.stallTimes.length >= STALL_DEGRADED_COUNT;
+}
+
+function syncThresholds(mediaType = state.currentMediaType) {
+  const cfg = SYNC_THRESHOLDS[mediaType === 'audio' ? 'audio' : 'video'];
+  const jitter = (state.sync.clock?.jitter || 0) / 1000;
+  const soft = Math.min(cfg.softMax, cfg.softBase + 1.5 * jitter);
+  const hard = isDegradedLink() ? STALL_DEGRADED_HARD_SECONDS : Math.min(cfg.hardMax, cfg.hardBase + cfg.hardJitterGain * jitter);
+  return { soft, release: soft * 0.4, hard, event: Math.max(0.5, soft + 0.2), capNear: cfg.capNear, capFar: cfg.capFar };
+}
+
+function clampToDuration(target, media = getMedia()) {
+  const duration = Number(media?.duration);
+  return Number.isFinite(duration) && duration > 0 ? Math.min(target, Math.max(0, duration - 0.25)) : target;
+}
+
+function resetDriftFilter(value = 0) {
+  state.sync.driftFiltered = value;
+  state.sync.hardStreak = 0;
+}
+
+// Gentle convergence: speed up or slow down a little so a member drifts back into step without the
+// jump cut a seek would cause. Nudging starts past `soft` and only releases once well inside it,
+// so the rate does not flap around the edge; speeding up is throttled when the buffer is thin
+// because racing ahead on a starving link only provokes the next stall.
 function applyDriftNudge(drift, media) {
+  const thresholds = syncThresholds();
   const abs = Math.abs(drift);
   const nudging = state.sync.nudgeRate !== 1;
-  const threshold = nudging ? NUDGE_RELEASE_THRESHOLD_SECONDS : SOFT_SYNC_THRESHOLD_SECONDS;
+  const threshold = nudging ? thresholds.release : thresholds.soft;
   let rate = 1;
   if (abs >= threshold && media?.readyState >= 3) {
-    const delta = Math.min(NUDGE_RATE_MAX_DELTA, 0.06 + abs * 0.08);
-    rate = Number((drift > 0 ? 1 + delta : 1 - delta).toFixed(3));
+    let cap = abs < 1 ? thresholds.capNear : thresholds.capFar;
+    if (drift > 0 && bufferedAheadAt(media, media.currentTime || 0) < SYNC_STARVED_BUFFER_SECONDS) cap = Math.min(cap, 0.03);
+    const delta = Math.min(cap, 0.04 + abs * 0.08);
+    // Quantised to 1%: the element is not asked to re-time its output on every 250 ms sample.
+    rate = Number((drift > 0 ? 1 + delta : 1 - delta).toFixed(2));
   }
   if (rate !== state.sync.nudgeRate) setPlaybackRate(rate);
+}
+
+// ---- Control loop ------------------------------------------------------------------------------
+// Drift is sampled locally against the timeline every SYNC_LOOP_MS instead of once per heartbeat,
+// so packet jitter never lands in a drift sample; heartbeats only refresh the anchor and version.
+function startSyncLoop() {
+  stopSyncLoop();
+  state.syncTimer = setInterval(syncLoopTick, SYNC_LOOP_MS);
+}
+
+function stopSyncLoop() {
+  clearInterval(state.syncTimer);
+  state.syncTimer = null;
+}
+
+function renderDriftIfChanged() {
+  const key = `${state.sync.drift.toFixed(1)}|${state.sync.nudgeRate}|${state.sync.mode}`;
+  if (key === state.syncLoopLastRender) return;
+  state.syncLoopLastRender = key;
+  if (!state.bufferingLocally && !state.sourceLoading && ['synced', 'nudging'].includes(state.sync.mode)) settleSyncMode();
+  else renderSyncBar();
+}
+
+function syncLoopTick() {
+  const remote = state.latestRemoteState;
+  const media = getMedia();
+  if (!remote || !media || !state.currentMediaUrl || state.sync.connection !== 'online') return;
+  if (!remote.isPlaying || media.paused || media.ended || media.seeking || state.sourceLoading || document.hidden) {
+    if (state.sync.nudgeRate !== 1 && (!remote.isPlaying || media.paused)) setPlaybackRate(1);
+    return;
+  }
+  if (isScheduled(remote) || hasLocalSeekIntent() || hasExplicitPauseIntent()) return;
+  const raw = remoteProgressDrift(remote, media);
+  state.sync.driftFiltered += SYNC_DRIFT_EMA_ALPHA * (raw - state.sync.driftFiltered);
+  state.sync.drift = raw;
+  if (state.bufferingLocally || media.readyState < 3) {
+    renderDriftIfChanged();
+    return;
+  }
+  const thresholds = syncThresholds();
+  // A hard seek needs two consecutive raw samples beyond `hard` (one glitch is not evidence), a
+  // cooldown, and a link that is not already struggling.
+  state.sync.hardStreak = Math.abs(raw) > thresholds.hard ? state.sync.hardStreak + 1 : 0;
+  if (state.sync.hardStreak >= SYNC_HARD_CONFIRMATIONS && Date.now() - state.sync.lastHardSeekAt > SYNC_HARD_SEEK_COOLDOWN_MS && !isDegradedLink()) {
+    const target = clampToDuration(remoteTargetPosition(remote), media);
+    if (canApplyProgressSeek(media, target)) {
+      state.sync.lastHardSeekAt = Date.now();
+      seekMediaTo(target, 900);
+      resetDriftFilter();
+      renderDriftIfChanged();
+      return;
+    }
+  }
+  applyDriftNudge(state.sync.driftFiltered, media);
+  renderDriftIfChanged();
+}
+
+// ---- Scheduled start ---------------------------------------------------------------------------
+// The node anchors every play/seek a little in the future. Each member seeks to the position, waits
+// with the buffer filling, and starts on the anchor instant in its own clock — so members with very
+// different latency to the node still start together. A member that is not ready in time simply
+// starts late and catches up; the room never waits.
+function clearScheduledStart() {
+  if (state.scheduledStart?.timer) clearTimeout(state.scheduledStart.timer);
+  state.scheduledStart = null;
+}
+
+function armScheduledStart(remote = state.latestRemoteState) {
+  if (!isScheduled(remote)) {
+    if (state.scheduledStart) clearScheduledStart();
+    return false;
+  }
+  const version = Number(remote.version || 0);
+  if (state.scheduledStart && state.scheduledStart.version === version) return true;
+  clearScheduledStart();
+  const delay = remoteAnchorDelayMs(remote);
+  const position = Number(remote.position || 0);
+  state.desiredPlaying = true;
+  // Already on the frame (the initiator after its own drag): no redundant seek.
+  if (state.sourceLoading || !mediaCanSeek() || Math.abs(getMediaTime() - position) > 0.1) setPendingSeek(position);
+  if (!state.sourceLoading) {
+    applyPendingSeek();
+    if (!getMediaPaused()) {
+      suppressLocalMediaEvents(300);
+      pauseMedia();
+    }
+  }
+  resetDriftFilter();
+  setSyncMode('scheduled');
+  state.scheduledStart = { at: Number(remote.updatedAt), version, timer: setTimeout(fireScheduledStart, Math.max(0, delay)) };
+  renderPlaybackControls();
+  return true;
+}
+
+function fireScheduledStart() {
+  const scheduled = state.scheduledStart;
+  state.scheduledStart = null;
+  const remote = state.latestRemoteState;
+  if (!scheduled || !remote || Number(remote.version || 0) !== scheduled.version || !remote.isPlaying || hasExplicitPauseIntent()) {
+    settleSyncMode();
+    return;
+  }
+  if (state.sourceLoading) {
+    // Still loading: start as soon as the source is ready and let the loop catch up.
+    state.pendingAutoplay = true;
+    setSyncMode('loading');
+    return;
+  }
+  applyPendingSeek();
+  state.pendingAutoplay = false;
+  markLocalPlay();
+  suppressLocalMediaEvents(900);
+  playMedia().then(() => {
+    resetDriftFilter();
+    settleSyncMode();
+  }).catch(() => setSyncMode('ready', '点击播放'));
+}
+
+// ---- Stalls ------------------------------------------------------------------------------------
+// Nobody waits for a buffering member. The member itself reports its status (so the member list
+// can show it) and, once the media resumes, jumps back onto the timeline if the gap is real and
+// the target is buffered — otherwise it nudges its way back.
+function reportMemberStatus(status) {
+  if (state.memberStatusSent === status) return;
+  state.memberStatusSent = status;
+  if (state.ws?.readyState === WebSocket.OPEN) {
+    try {
+      state.ws.send(JSON.stringify({ type: 'member_status', status }));
+    } catch {}
+  }
+}
+
+function noteStallStart() {
+  if (state.bufferingLocally) return;
+  state.bufferingLocally = true;
+  state.stallStartedAt = Date.now();
+  noteStall();
+  if (state.sync.nudgeRate !== 1) setPlaybackRate(1);
+  setSyncMode('buffering', isDegradedLink() ? '网络不稳' : '');
+  clearTimeout(state.stallReportTimer);
+  state.stallReportTimer = setTimeout(() => {
+    if (state.bufferingLocally) reportMemberStatus('buffering');
+  }, 400);
+}
+
+function recoverFromStall() {
+  clearTimeout(state.stallReportTimer);
+  if (!state.bufferingLocally) return;
+  state.bufferingLocally = false;
+  reportMemberStatus('playing');
+  const remote = state.latestRemoteState;
+  const media = getMedia();
+  if (remote?.isPlaying && media && !media.paused && state.desiredPlaying && !hasLocalSeekIntent() && !isScheduled(remote)) {
+    const target = clampToDuration(remoteTargetPosition(remote), media);
+    const drift = target - (media.currentTime || 0);
+    const degraded = isDegradedLink();
+    if (!degraded && Math.abs(drift) > CATCHUP_SEEK_SECONDS && hasBufferedTarget(media, target, 1.0)) {
+      seekMediaTo(target, 900);
+    } else if (!degraded && Math.abs(drift) > syncThresholds().hard && Date.now() - state.lastCatchupSeekAt > 4000) {
+      seekMediaTo(target, 900);
+    }
+    resetDriftFilter();
+  }
+  settleSyncMode();
+}
+
+function controlActionForReason(reason) {
+  return reason === 'play' || reason === 'pause' || reason === 'seek' ? reason : undefined;
 }
 
 function sendState(reason, overrides = {}) {
@@ -1065,6 +1393,8 @@ function sendState(reason, overrides = {}) {
   try {
     state.ws.send(JSON.stringify({
       type: 'state_update',
+      action: controlActionForReason(reason),
+      clientTime: serverNow(),
       state: {
         videoUrl: state.currentMediaUrl || state.currentVideoUrl,
         mediaUrl: state.currentMediaUrl || state.currentVideoUrl,
@@ -1095,7 +1425,7 @@ function hasRecentMediaIntent() {
   return Date.now() <= state.mediaIntentUntil;
 }
 
-function markExplicitPause(duration = 2500) {
+function markExplicitPause(duration = EXPLICIT_PAUSE_LOCK_MS) {
   state.explicitPauseUntil = Date.now() + duration;
   state.localPlayUntil = 0;
 }
@@ -1104,7 +1434,7 @@ function hasExplicitPauseIntent() {
   return Date.now() <= state.explicitPauseUntil;
 }
 
-function markLocalPlay(duration = 4000) {
+function markLocalPlay(duration = LOCAL_PLAY_LOCK_MS) {
   state.localPlayUntil = Date.now() + duration;
   state.explicitPauseUntil = 0;
 }
@@ -1132,12 +1462,23 @@ function hasLocalSeekIntent() {
   return Date.now() <= state.localSeekUntil;
 }
 
+// Our own seeks must not be mistaken for a user drag. The lock is event-based — `seeked` clears it —
+// with a hard cap, because on HLS an unbuffered target can take seconds to report `seeked`.
 function markProgrammaticSeek(duration = 1400) {
-  state.programmaticSeekUntil = Date.now() + duration;
+  state.programmaticSeekUntil = Date.now() + Math.min(duration, PROGRAMMATIC_SEEK_CAP_MS);
 }
 
+// A programmatic seek is recognised by its target as well as by time: on a starving link the
+// `seeked` for an unbuffered target can arrive long after any reasonable time lock, and treating
+// it as a user drag would commit the catch-up to the room.
 function hasProgrammaticSeekIntent() {
-  return Date.now() <= state.programmaticSeekUntil;
+  if (Date.now() <= state.programmaticSeekUntil) return true;
+  return state.programmaticSeekTarget !== null && Math.abs(getMediaTime() - state.programmaticSeekTarget) < 0.5;
+}
+
+function clearProgrammaticSeek() {
+  state.programmaticSeekUntil = 0;
+  state.programmaticSeekTarget = null;
 }
 
 function rememberLocalSeekTarget(value) {
@@ -1162,8 +1503,29 @@ function localRoomStatePatch(isPlaying, position = getMediaTime()) {
     playbackModes: normalizePlaybackModes(state.playbackModes),
     isPlaying,
     position,
+    updatedAt: serverNow(),
     serverTime: serverNow()
   };
+}
+
+// The initiator's own estimate of the node's scheduled-start lead. It errs late (a full RTT
+// rather than half) so the echo carrying the real anchor always lands before this timer fires.
+function localLeadMs() {
+  const rtt = Number(state.sync.clock.rtt);
+  return Math.min(1200, Math.max(300, (Number.isFinite(rtt) ? rtt : 250) + 250));
+}
+
+function socketIsOpen() {
+  return Boolean(state.ws && state.ws.readyState === WebSocket.OPEN);
+}
+
+// A play or seek that will start the room takes the scheduled path locally too: the initiator
+// pauses on the target frame and starts on the same instant as everyone else instead of running
+// ahead for a round trip and being pulled back. Returns true when a start was scheduled.
+function scheduleLocalStart(patch) {
+  if (!socketIsOpen() || !patch.isPlaying) return false;
+  patch.updatedAt = serverNow() + localLeadMs();
+  return armScheduledStart(patch);
 }
 
 function commitLocalSeek(reason = 'seek', options = {}) {
@@ -1173,10 +1535,11 @@ function commitLocalSeek(reason = 'seek', options = {}) {
   state.lastLocalControlAt = Date.now();
   state.latestRemoteState = localRoomStatePatch(isPlaying, position);
   sendState(reason, { isPlaying, position });
+  scheduleLocalStart(state.latestRemoteState);
 }
 
 function commitLocalPlay(reason = 'play') {
-  if (!state.currentMediaUrl) return;
+  if (!state.currentMediaUrl) return false;
   state.lastLocalControlAt = Date.now();
   state.desiredPlaying = true;
   state.latestRemoteState = localRoomStatePatch(true);
@@ -1185,13 +1548,15 @@ function commitLocalPlay(reason = 'play') {
   renderMediaQueue();
   renderPlaybackControls();
   sendState(reason, { isPlaying: true });
+  return scheduleLocalStart(state.latestRemoteState);
 }
 
 function commitLocalPause(reason = 'pause') {
   state.lastLocalControlAt = Date.now();
   state.desiredPlaying = false;
   state.latestRemoteState = localRoomStatePatch(false);
-  markExplicitPause(6000);
+  markExplicitPause(EXPLICIT_PAUSE_LOCK_MS);
+  clearScheduledStart();
   clearCatchupStatus();
   setPlaybackRate(1);
   renderMediaQueue();
@@ -1199,13 +1564,34 @@ function commitLocalPause(reason = 'pause') {
   sendState(reason, { isPlaying: false });
 }
 
+// The anchor the timeline extrapolates from. New nodes emit `updatedAt` as the anchor (now while
+// playing, the start instant while scheduled); an older node's `updatedAt` is stale, so fall back
+// to its `serverTime` when the two are far apart.
+function remoteAnchorMs(remote) {
+  const anchor = Number(remote?.updatedAt);
+  const serverTime = Number(remote?.serverTime);
+  if (Number.isFinite(anchor) && (!Number.isFinite(serverTime) || anchor >= serverTime - 1500)) return anchor;
+  return Number.isFinite(serverTime) ? serverTime : NaN;
+}
+
 function remoteTargetPosition(remote = state.latestRemoteState) {
   if (!remote) return 0;
   let position = Number(remote.position || 0);
-  if (remote.isPlaying && Number.isFinite(Number(remote.serverTime))) {
-    position += Math.max(0, (serverNow() - Number(remote.serverTime)) / 1000);
+  if (remote.isPlaying) {
+    const anchor = remoteAnchorMs(remote);
+    if (Number.isFinite(anchor)) position += Math.max(0, (serverNow() - anchor) / 1000);
   }
   return Math.max(0, position);
+}
+
+function remoteAnchorDelayMs(remote = state.latestRemoteState) {
+  if (!remote?.isPlaying) return 0;
+  const anchor = remoteAnchorMs(remote);
+  return Number.isFinite(anchor) ? anchor - serverNow() : 0;
+}
+
+function isScheduled(remote = state.latestRemoteState) {
+  return remoteAnchorDelayMs(remote) > SYNC_SCHEDULED_MIN_LEAD_MS;
 }
 
 function remoteProgressDrift(remote = state.latestRemoteState, media = getMedia()) {
@@ -1215,7 +1601,7 @@ function remoteProgressDrift(remote = state.latestRemoteState, media = getMedia(
 }
 
 function shouldSyncByProgress(remote = state.latestRemoteState, media = getMedia()) {
-  return Math.abs(remoteProgressDrift(remote, media)) > PROGRESS_SYNC_THRESHOLD_SECONDS;
+  return Math.abs(remoteProgressDrift(remote, media)) > syncThresholds().hard;
 }
 
 function bufferedAheadAt(media, time) {
@@ -1238,8 +1624,10 @@ function canApplyProgressSeek(media, target) {
 
 function clearCatchupStatus() {
   clearTimeout(state.catchupTimer);
+  clearTimeout(state.stallReportTimer);
   state.catchupTimer = null;
   state.bufferingLocally = false;
+  reportMemberStatus('playing');
   if (state.sync.nudgeRate !== 1) setPlaybackRate(1);
   settleSyncMode();
 }
@@ -1258,15 +1646,21 @@ function seekMediaTo(target, suppressDuration = 900) {
   const art = state.currentMediaType === 'video' ? state.artPlayer || getPlayerCore() : null;
   const media = getMedia();
   if ((!art && !media) || !Number.isFinite(target)) return;
-  if (state.lastSeekTarget !== null && Math.abs(target - state.lastSeekTarget) < 0.6 && Date.now() - state.lastCatchupSeekAt < 5000) return;
+  // Only skip a repeat while the previous seek to the same spot is still in flight.
+  if (media?.seeking && state.lastSeekTarget !== null && Math.abs(target - state.lastSeekTarget) < 0.6 && Date.now() - state.lastCatchupSeekAt < 5000) return;
   markProgrammaticSeek(Math.max(2500, suppressDuration + 2500));
   markSeekIntent();
   suppressLocalMediaEvents(suppressDuration);
   if (state.sync.nudgeRate !== 1) setPlaybackRate(1);
   try {
     const nextTime = Math.max(0, target);
-    if (art) art.currentTime = nextTime;
-    else media.currentTime = nextTime;
+    state.programmaticSeekTarget = nextTime;
+    // Write the element directly: Artplayer's setter clamps to its own `duration`, which is 0 for
+    // a stream whose duration is still unknown (MediaRecorder webm, in-progress transcodes), and
+    // that would turn every catch-up seek into a jump to the start.
+    const element = media || art?.video;
+    if (element) element.currentTime = nextTime;
+    else art.currentTime = nextTime;
     state.lastSeekTarget = Math.max(0, target);
     state.lastCatchupSeekAt = Date.now();
     state.sync.drift = 0;
@@ -1290,6 +1684,11 @@ function finishSourcePreload() {
   if (!state.sourceLoading && state.pendingSeekTime === null) return;
   applyPendingSeek();
   state.sourceLoading = false;
+  // A start that is still scheduled waits for its instant instead of autoplaying early.
+  if (state.latestRemoteState?.isPlaying && isScheduled(state.latestRemoteState)) {
+    armScheduledStart(state.latestRemoteState);
+    return;
+  }
   if (state.pendingAutoplay && state.desiredPlaying && !hasExplicitPauseIntent()) {
     markLocalPlay();
     suppressLocalMediaEvents(900);
@@ -1311,26 +1710,35 @@ function runCatchup() {
     setSyncMode('seeking');
     return;
   }
-  if (!media || !remote?.isPlaying || !state.currentMediaUrl || hasExplicitPauseIntent() || !state.desiredPlaying) {
+  if (!media || !remote?.isPlaying || !state.currentMediaUrl || hasExplicitPauseIntent() || !state.desiredPlaying || media.ended) {
     clearCatchupStatus();
     return;
   }
-  const target = remoteTargetPosition(remote);
-  const drift = remoteProgressDrift(remote, media);
-  if (Math.abs(drift) <= PROGRESS_SYNC_THRESHOLD_SECONDS) {
-    clearCatchupStatus();
+  if (isScheduled(remote)) {
+    state.bufferingLocally = false;
+    armScheduledStart(remote);
     return;
   }
-  if (canApplyProgressSeek(media, target)) {
+  const target = clampToDuration(remoteTargetPosition(remote), media);
+  const drift = target - (media.currentTime || 0);
+  const degraded = isDegradedLink();
+  const gapIsReal = (Math.abs(drift) > CATCHUP_SEEK_SECONDS && hasBufferedTarget(media, target, 1.0)) || Math.abs(drift) > syncThresholds().hard;
+  if (!degraded && gapIsReal && canApplyProgressSeek(media, target) && Date.now() - state.lastCatchupSeekAt > 4000) {
     seekMediaTo(target, 900);
   }
   const ahead = bufferedAheadAt(media, media.currentTime || 0);
   if (media.readyState >= 3 || ahead >= 0.8) {
+    if (!media.paused) {
+      resetDriftFilter();
+      clearCatchupStatus();
+      return;
+    }
     markLocalPlay();
     suppressLocalMediaEvents(900);
     playMedia()
       .then(() => {
         state.sync.drift = remoteTargetPosition(remote) - getMediaTime();
+        resetDriftFilter();
         clearCatchupStatus();
       })
       .catch(() => scheduleCatchup('blocked'));
@@ -1350,7 +1758,7 @@ function scheduleCatchup(reason = 'buffering') {
     setSyncMode('ready', '点击播放');
     return;
   }
-  if (!shouldSyncByProgress(remote, media)) return;
+  if (media?.ended) return;
   if (hasLocalSeekIntent() || media?.seeking) {
     setSyncMode('seeking');
     return;
@@ -1418,6 +1826,8 @@ function stopInactiveMedia(nextType) {
 
 function setMediaSource(url, options = {}) {
   initVideoPlayer();
+  clearScheduledStart();
+  resetDriftFilter();
   const mediaType = normalizeMediaType(options.mediaType || state.roomMode);
   const previousMediaUrl = state.currentMediaUrl;
   stopInactiveMedia(mediaType);
@@ -2002,7 +2412,7 @@ async function addMusicTrack(url, options = {}) {
   return addMediaTrack(url, { ...options, mediaType: 'audio' });
 }
 
-function applyRemoteState(remote, reason = 'state_sync') {
+function applyRemoteState(remote, reason = 'state_sync', origin = '') {
   if (!remote) return;
   const previousRemote = state.latestRemoteState;
   const previousVersion = Number(previousRemote?.version || 0);
@@ -2010,13 +2420,18 @@ function applyRemoteState(remote, reason = 'state_sync') {
   const isNewerRemoteState = remoteVersion > previousVersion;
   const isStaleRemoteState = remoteVersion && previousVersion && remoteVersion < previousVersion;
   if (isStaleRemoteState) return;
+  // Our own control action echoed back: adopt the timeline, never re-apply the action.
+  const isEcho = Boolean(origin) && origin === state.connectionId;
   const remoteMediaUrl = remote.mediaUrl || remote.videoUrl || '';
   const remoteRoomMode = normalizeMediaType(remote.roomMode || remote.mediaType || state.roomMode);
   const remoteMediaType = normalizeMediaType(remote.mediaType || remoteRoomMode);
   const mediaChanged = remoteMediaUrl !== state.currentMediaUrl || remoteMediaType !== state.currentMediaType;
-  if (isNewerRemoteState && reason !== 'state_sync' && reason !== 'snapshot') noteRemoteAction(remote, reason, mediaChanged);
+  if (isNewerRemoteState && !isEcho && reason !== 'state_sync' && reason !== 'snapshot') noteRemoteAction(remote, reason, mediaChanged);
   state.roomMode = remoteRoomMode;
-  state.mediaQueues = normalizeMediaQueues(remote.mediaQueues || { audio: remote.musicQueue || state.mediaQueues.audio, video: state.mediaQueues.video });
+  // Heartbeats carry only the timeline; queues, modes and metadata stay as they are when absent.
+  if ('mediaQueues' in remote || 'musicQueue' in remote) {
+    state.mediaQueues = normalizeMediaQueues(remote.mediaQueues || { audio: remote.musicQueue || state.mediaQueues.audio, video: state.mediaQueues.video });
+  }
   state.playbackModes = normalizePlaybackModes(remote.playbackModes || state.playbackModes);
   state.musicQueue = state.mediaQueues.audio;
   state.currentTrackId = remote.currentTrackId || '';
@@ -2037,6 +2452,7 @@ function applyRemoteState(remote, reason = 'state_sync') {
       meta: remote.mediaMeta,
       currentTrackId: remote.currentTrackId
     });
+    armScheduledStart(remote);
     return;
   }
   const player = getMedia();
@@ -2049,13 +2465,31 @@ function applyRemoteState(remote, reason = 'state_sync') {
   state.latestRemoteState = remote;
   state.desiredPlaying = Boolean(remote.isPlaying);
   if (!remote.isPlaying) state.pendingAutoplay = false;
+  if (isNewerRemoteState) resetDriftFilter();
   state.sync.drift = remote.isPlaying && !player.paused ? drift : 0;
   renderMediaQueue();
   updateMusicProgressUi();
   renderPlaybackControls();
-  // Explicit actions (play/pause/seek/queue) align tightly; the once-a-second heartbeat only seeks
-  // past HARD and otherwise nudges the playback rate so nobody sees a jump.
-  const seekThreshold = isPeriodicSync ? PROGRESS_SYNC_THRESHOLD_SECONDS : 0.35;
+  // A future anchor is a scheduled start: seek now, start on the instant. The initiator's own
+  // echo takes the same path so everyone behaves identically.
+  if (armScheduledStart(remote)) return;
+  if (!remote.isPlaying && state.scheduledStart) clearScheduledStart();
+  if (isEcho) {
+    // Our optimistic schedule paused the player; if the node's answer is "already playing" or
+    // its anchor has passed, start now and let the loop converge.
+    if (remote.isPlaying && player.paused && !state.sourceLoading && !hasExplicitPauseIntent()) {
+      applyPendingSeek();
+      markLocalPlay();
+      suppressLocalMediaEvents(900);
+      playMedia().then(() => settleSyncMode()).catch(() => scheduleCatchup('blocked'));
+      return;
+    }
+    if (!state.bufferingLocally && !state.sourceLoading) settleSyncMode();
+    return;
+  }
+  // Explicit events align tightly because their target is exact; the heartbeat leaves
+  // corrections to the control loop, which filters drift and never reacts to one sample.
+  const thresholds = syncThresholds(remoteMediaType);
   if (remote.isPlaying) {
     if (hasExplicitPauseIntent() && !isNewerRemoteState) return;
     if (state.sourceLoading) {
@@ -2064,14 +2498,14 @@ function applyRemoteState(remote, reason = 'state_sync') {
       return;
     }
     applyPendingSeek();
-    if (Math.abs(drift) > seekThreshold) {
-      if (canApplyProgressSeek(player, target)) {
-        seekMediaTo(target, 900);
+    if (!isPeriodicSync && Math.abs(drift) > thresholds.event) {
+      const clamped = clampToDuration(target, player);
+      if (canApplyProgressSeek(player, clamped)) {
+        seekMediaTo(clamped, 900);
+        resetDriftFilter();
       } else {
         scheduleCatchup('buffering');
       }
-    } else if (isPeriodicSync && !player.paused && !state.bufferingLocally) {
-      applyDriftNudge(drift, player);
     } else if (!isPeriodicSync && state.sync.nudgeRate !== 1) {
       setPlaybackRate(1);
     }
@@ -2083,7 +2517,7 @@ function applyRemoteState(remote, reason = 'state_sync') {
       return;
     }
     applyPendingSeek();
-    if (Number.isFinite(target) && Math.abs(drift) > seekThreshold) seekMediaTo(target, 900);
+    if (Number.isFinite(target) && Math.abs(drift) > thresholds.event) seekMediaTo(target, 900);
   }
   if (remote.isPlaying && state.currentMediaUrl && player.paused) {
     if (hasExplicitPauseIntent() && !isNewerRemoteState) return;
@@ -2108,9 +2542,17 @@ function applyRemoteState(remote, reason = 'state_sync') {
   if (!state.bufferingLocally && !state.sourceLoading) settleSyncMode();
 }
 
+const MEMBER_LATENCY_VISIBLE_MS = 300;
+
+function memberLatencyBucket(rtt) {
+  const value = Number(rtt);
+  if (!Number.isFinite(value) || value < MEMBER_LATENCY_VISIBLE_MS) return '';
+  return String(Math.round(value / 50) * 50);
+}
+
 function renderMembers(members) {
   const list = $('#memberList');
-  const key = members.map((member) => member.username).join(' ');
+  const key = members.map((member) => `${member.username}:${member.status === 'buffering' ? 'b' : 'p'}:${memberLatencyBucket(member.rtt)}`).join(' ');
   $('#memberCount').textContent = String(members.length);
   if (key === state.membersKey && list.childElementCount) return;
   state.membersKey = key;
@@ -2123,10 +2565,25 @@ function renderMembers(members) {
   const fragment = document.createDocumentFragment();
   for (const member of members) {
     const chip = document.createElement('span');
-    chip.className = `member-chip${member.username === me ? ' is-self' : ''}`;
+    const buffering = member.status === 'buffering';
+    chip.className = `member-chip${member.username === me ? ' is-self' : ''}${buffering ? ' is-buffering' : ''}`;
     const name = document.createElement('span');
     name.textContent = member.username;
     chip.append(avatarEl(member.username, 'xs'), name);
+    if (buffering) {
+      const dot = document.createElement('span');
+      dot.className = 'member-status';
+      dot.title = '正在缓冲';
+      chip.appendChild(dot);
+    }
+    const latencyBucket = memberLatencyBucket(member.rtt);
+    if (latencyBucket) {
+      const latency = document.createElement('span');
+      latency.className = 'member-latency';
+      latency.textContent = `${latencyBucket}ms`;
+      latency.title = '到同步节点的往返延迟';
+      chip.appendChild(latency);
+    }
     fragment.appendChild(chip);
   }
   list.appendChild(fragment);
@@ -4093,6 +4550,8 @@ function bindEvents() {
     state.roomSession = null;
     clearTimeout(state.reconnectTimer);
     stopLatencyMonitor();
+    stopSyncLoop();
+    clearScheduledStart();
     if (state.ws) {
       state.ws._manualClose = true;
       state.ws.close();
@@ -4148,6 +4607,11 @@ function bindEvents() {
     for (const eventName of ['pointerdown', 'touchstart', 'keydown']) {
       player.addEventListener(eventName, markPlayerIntent);
     }
+    // Artplayer's hotkeys listen on the document (gated by its own focus flag), so a Space or
+    // arrow press never reaches the shell listener above.
+    document.addEventListener('keydown', (event) => {
+      if (state.artPlayer?.isFocus && !event.altKey && !event.ctrlKey && !event.metaKey) markPlayerIntent();
+    });
     bindPlayerEvent('seeking', () => {
       if (hasProgrammaticSeekIntent()) return;
       rememberLocalSeekTarget(getMediaTime());
@@ -4169,9 +4633,13 @@ function bindEvents() {
     bindPlayerEvent('play', () => {
       ensureVideoVisible();
       clearTimeout(state.pendingPauseTimer);
-      markLocalPlay();
       settleSyncMode();
-      if (Date.now() > state.suppressUntil) commitLocalPlay('play');
+      // Only a play the user caused is committed; programmatic plays (catch-up, scheduled start,
+      // remote state) are marked by playMedia() and never rewrite the room.
+      if (!hasProgrammaticPlay() && hasRecentMediaIntent() && Date.now() > state.suppressUntil) {
+        markLocalPlay();
+        commitLocalPlay('play');
+      }
       renderPlaybackControls();
     });
     bindPlayerEvent('pause', () => {
@@ -4199,13 +4667,16 @@ function bindEvents() {
         sendState('pause');
       }, 260);
     });
-    for (const eventName of ['waiting', 'stalled', 'suspend']) {
+    // `suspend` fires on healthy playback too (buffer full), so only `waiting`/`stalled` count, and
+    // only when the element really has nothing to play.
+    for (const eventName of ['waiting', 'stalled']) {
       bindPlayerEvent(eventName, () => {
-        if (hasLocalSeekIntent()) {
+        if (hasLocalSeekIntent() || player.seeking) {
           setSyncMode('seeking');
           return;
         }
-        if (state.latestRemoteState?.isPlaying || hasLocalPlayIntent()) scheduleCatchup('本地缓冲');
+        if (player.readyState >= 3 || player.ended || state.sourceLoading) return;
+        if (state.latestRemoteState?.isPlaying || hasLocalPlayIntent()) noteStallStart();
       });
     }
     bindPlayerEvent('error', () => {
@@ -4231,12 +4702,17 @@ function bindEvents() {
       bindPlayerEvent(eventName, () => {
         ensureVideoVisible();
         finishSourcePreload();
-        if (state.bufferingLocally) runCatchup();
-        else if (eventName === 'playing' || (state.currentMediaUrl && player.readyState >= 3 && state.sync.mode === 'loading')) settleSyncMode();
+        if (state.bufferingLocally) {
+          if (state.catchupTimer) runCatchup();
+          else if (eventName === 'playing' || (eventName !== 'progress' && player.readyState >= 3 && !player.paused)) recoverFromStall();
+        } else if (eventName === 'playing' || (state.currentMediaUrl && player.readyState >= 3 && state.sync.mode === 'loading')) settleSyncMode();
       });
     }
     bindPlayerEvent('seeked', () => {
-      if (hasProgrammaticSeekIntent()) return;
+      if (hasProgrammaticSeekIntent()) {
+        clearProgrammaticSeek();
+        return;
+      }
       markLocalSeekIntent(LOCAL_SEEK_COMMIT_LOCK_MS);
       clearTimeout(state.seekCommitTimer);
       state.seekCommitTimer = setTimeout(() => {
@@ -4280,9 +4756,11 @@ function bindEvents() {
     bindAudioEvent('play', () => {
       if (state.currentMediaType !== 'audio') return;
       clearTimeout(state.pendingPauseTimer);
-      markLocalPlay();
       settleSyncMode();
-      if (Date.now() > state.suppressUntil) commitLocalPlay('play');
+      if (!hasProgrammaticPlay() && hasRecentMediaIntent() && Date.now() > state.suppressUntil) {
+        markLocalPlay();
+        commitLocalPlay('play');
+      }
       updateMusicProgressUi();
       renderMediaQueue();
       renderPlaybackControls();
@@ -4315,14 +4793,15 @@ function bindEvents() {
         sendState('pause');
       }, 260);
     });
-    for (const eventName of ['waiting', 'stalled', 'suspend']) {
+    for (const eventName of ['waiting', 'stalled']) {
       bindAudioEvent(eventName, () => {
         if (state.currentMediaType !== 'audio') return;
-        if (hasLocalSeekIntent()) {
+        if (hasLocalSeekIntent() || audioPlayer.seeking) {
           setSyncMode('seeking');
           return;
         }
-        if (state.latestRemoteState?.isPlaying || hasLocalPlayIntent()) scheduleCatchup('本地缓冲');
+        if (audioPlayer.readyState >= 3 || audioPlayer.ended || state.sourceLoading) return;
+        if (state.latestRemoteState?.isPlaying || hasLocalPlayIntent()) noteStallStart();
       });
     }
     bindAudioEvent('error', () => {
@@ -4337,8 +4816,10 @@ function bindEvents() {
         finishSourcePreload();
         updateMusicProgressUi();
         if (eventName === 'playing') renderMediaQueue();
-        if (state.bufferingLocally) runCatchup();
-        else if (eventName === 'playing' || (state.currentMediaUrl && audioPlayer.readyState >= 3 && state.sync.mode === 'loading')) settleSyncMode();
+        if (state.bufferingLocally) {
+          if (state.catchupTimer) runCatchup();
+          else if (eventName === 'playing' || (eventName !== 'progress' && audioPlayer.readyState >= 3 && !audioPlayer.paused)) recoverFromStall();
+        } else if (eventName === 'playing' || (state.currentMediaUrl && audioPlayer.readyState >= 3 && state.sync.mode === 'loading')) settleSyncMode();
       });
     }
     bindAudioEvent('timeupdate', updateMusicProgressUi);
@@ -4346,7 +4827,11 @@ function bindEvents() {
       if (state.currentMediaType === 'audio') reportCurrentTrackDuration();
     });
     bindAudioEvent('seeked', () => {
-      if (state.currentMediaType !== 'audio' || hasProgrammaticSeekIntent()) return;
+      if (state.currentMediaType !== 'audio') return;
+      if (hasProgrammaticSeekIntent()) {
+        clearProgrammaticSeek();
+        return;
+      }
       markLocalSeekIntent(LOCAL_SEEK_COMMIT_LOCK_MS);
       clearTimeout(state.seekCommitTimer);
       state.seekCommitTimer = setTimeout(() => commitLocalSeek('seek', { force: true }), 140);
@@ -4383,7 +4868,7 @@ function bindEvents() {
     // Background tabs throttle timers; re-align quietly if we drifted while hidden.
     if (state.currentMediaUrl && state.desiredPlaying && state.latestRemoteState?.isPlaying) {
       const drift = remoteProgressDrift();
-      if (Math.abs(drift) > PROGRESS_SYNC_THRESHOLD_SECONDS) alignToRoom();
+      if (Math.abs(drift) > syncThresholds().hard) alignToRoom();
     }
   });
   window.addEventListener('online', resumeRoomConnectionIfNeeded);

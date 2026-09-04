@@ -42,10 +42,23 @@ const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB || 2048);
 const TLS_CERT_PATH = process.env.TLS_CERT_PATH || '';
 const TLS_KEY_PATH = process.env.TLS_KEY_PATH || '';
 const SYNC_STATE_FILE = process.env.SYNC_STATE_FILE || path.join(__dirname, 'rooms.json');
-const WS_HEARTBEAT_MS = 30000;
+const WS_HEARTBEAT_MS = 10000;
 const WS_MAX_PAYLOAD = 256 * 1024;
 const ROOM_EMPTY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const ENDED_DEDUPE_WINDOW_MS = 2500;
+// Scheduled start: a play/seek anchors the timeline slightly in the future so every member,
+// whatever its latency, starts on the same instant. Track changes get a longer lead because the
+// new source still has to load. Members that are not ready by then simply catch up on their own.
+const SYNC_LEAD_BASE_MS = 250;
+const SYNC_LEAD_MIN_MS = 300;
+const SYNC_LEAD_MAX_MS = 1200;
+const SYNC_TRACK_LEAD_BASE_MS = 600;
+const SYNC_TRACK_LEAD_MIN_MS = 600;
+const SYNC_TRACK_LEAD_MAX_MS = 2000;
+const SYNC_DEFAULT_RTT_MS = 200;
+const SYNC_CLIENT_TIME_MAX_AGE_MS = 2000;
+const MEMBERS_BROADCAST_COALESCE_MS = 500;
+const SYNC_TEST_HOOKS = process.env.SYNC_TEST_HOOKS === '1';
 const CHAT_BURST = 5;
 const CHAT_REFILL_PER_SECOND = 1;
 const TEXT_LIMITS = { title: 160, artist: 120, album: 120, sourceName: 180, coverUrl: 3000 };
@@ -1222,7 +1235,8 @@ function setCurrentTrack(room, track, user, isPlaying = true) {
   } : null;
   room.state.position = 0;
   room.state.isPlaying = Boolean(track && isPlaying);
-  room.state.updatedAt = Date.now();
+  // A new source needs loading everywhere, so its start is scheduled with the longer lead.
+  room.state.updatedAt = Date.now() + (room.state.isPlaying ? trackLeadMs(room) : 0);
   room.state.version = Number(room.state.version || 0) + 1;
   room.state.updatedBy = user?.username || 'system';
 }
@@ -1250,8 +1264,8 @@ function setRoomMode(room, user, mode) {
   return true;
 }
 
-function broadcastState(room, reason = 'control') {
-  broadcast(room, { type: 'state', state: computedState(room), reason });
+function broadcastState(room, reason = 'control', origin = '') {
+  broadcast(room, { type: 'state', state: computedState(room), reason, origin });
   persistRooms();
 }
 
@@ -1378,6 +1392,11 @@ function handleQueueMessage(room, user, message) {
       const endedTrackId = safeShortText(message.trackId, 80);
       if (endedTrackId && endedTrackId !== room.state.currentTrackId) return;
       if (room.state.mediaType !== mediaType) return;
+      // Members are allowed to fall behind (nobody waits), so a laggard can report `ended` long
+      // after the room moved on; only trust it when the timeline itself is near the end.
+      const duration = Number(currentTrack(room, mediaType)?.duration) || 0;
+      const nearEnd = duration > 0 ? Math.max(0, duration - 3) : 5;
+      if (room.state.isPlaying && livePosition(room) < nearEnd) return;
       // A repeat-one loop keeps the same track current, so a second report for it inside the
       // window is still a duplicate; legacy reports without a trackId rely on the window alone.
       const sinceLastAdvance = Date.now() - Number(room.lastEndedAdvanceAt || 0);
@@ -1447,24 +1466,63 @@ function roomFor(roomId) {
   return rooms.get(roomId);
 }
 
+// The room timeline: `position` is where playback was at `updatedAt` (the anchor); while playing,
+// the live position is position + elapsed. The anchor may sit in the future — that is how a
+// scheduled start is expressed: everyone seeks to `position` and starts the moment it arrives.
+function livePosition(room, atMs = Date.now()) {
+  const anchor = Number(room.state.updatedAt) || atMs;
+  const elapsed = room.state.isPlaying ? Math.max(0, (atMs - anchor) / 1000) : 0;
+  return Math.max(0, Number(room.state.position || 0) + elapsed);
+}
+
 function computedState(room) {
-  const elapsed = room.state.isPlaying ? Math.max(0, (Date.now() - room.state.updatedAt) / 1000) : 0;
+  const nowMs = Date.now();
+  const anchor = Number(room.state.updatedAt) || nowMs;
   room.state.mediaQueues = normalizeQueues(room.state.mediaQueues);
   room.state.musicQueue = legacyMusicQueue(room);
   room.state.playbackModes = normalizePlaybackModes(room.state.playbackModes);
   return {
     ...room.state,
-    position: Math.max(0, room.state.position + elapsed),
-    serverTime: Date.now()
+    position: livePosition(room, nowMs),
+    // Clients extrapolate from `updatedAt`: once playing it is "now" (position is already live),
+    // during a scheduled start it is the start instant, and when paused it is left alone.
+    updatedAt: room.state.isPlaying ? Math.max(anchor, nowMs) : anchor,
+    serverTime: nowMs
   };
 }
 
 function touchRoomState(room, user) {
   const current = computedState(room);
   room.state.position = current.position;
-  room.state.updatedAt = Date.now();
+  // Never pull a pending scheduled start back to "now": queue edits during the lead window must
+  // not make members start early and out of step.
+  room.state.updatedAt = Math.max(Date.now(), Number(room.state.updatedAt) || 0);
   room.state.version = Number(current.version || 0) + 1;
   room.state.updatedBy = user?.username || 'system';
+}
+
+function clampNumber(value, low, high) {
+  return Math.min(high, Math.max(low, value));
+}
+
+function maxMemberRtt(room) {
+  let max = 0;
+  let any = false;
+  for (const member of room.members.values()) {
+    if (Number.isFinite(member.rtt) && member.rtt > 0) {
+      any = true;
+      max = Math.max(max, member.rtt);
+    }
+  }
+  return any ? max : SYNC_DEFAULT_RTT_MS;
+}
+
+function playLeadMs(room) {
+  return clampNumber(maxMemberRtt(room) / 2 + SYNC_LEAD_BASE_MS, SYNC_LEAD_MIN_MS, SYNC_LEAD_MAX_MS);
+}
+
+function trackLeadMs(room) {
+  return clampNumber(maxMemberRtt(room) / 2 + SYNC_TRACK_LEAD_BASE_MS, SYNC_TRACK_LEAD_MIN_MS, SYNC_TRACK_LEAD_MAX_MS);
 }
 
 function pauseCurrentTrack(room, user) {
@@ -1482,14 +1540,37 @@ function distinctMembers(room) {
     byUser.set(member.userId, {
       userId: member.userId,
       username: member.username,
-      joinedAt: member.joinedAt
+      joinedAt: member.joinedAt,
+      rtt: Number.isFinite(member.rtt) ? Math.round(member.rtt) : null,
+      status: member.status === 'buffering' ? 'buffering' : 'playing'
     });
   }
   return Array.from(byUser.values()).sort((a, b) => a.username.localeCompare(b.username));
 }
 
+function memberRttBucket(rtt) {
+  return Number.isFinite(rtt) && rtt >= 300 ? Math.round(rtt / 100) : 0;
+}
+
+function noteMemberRtt(member, rtt, room = null) {
+  const value = Number(rtt);
+  if (!Number.isFinite(value) || value < 0 || value > 5000 || member.rttPinned) return;
+  const before = memberRttBucket(member.rtt);
+  member.rtt = Number.isFinite(member.rtt) ? member.rtt * 0.7 + value * 0.3 : value;
+  // The member list shows latency once it matters (≥ 300 ms); refresh it when the bucket moves.
+  if (room && memberRttBucket(member.rtt) !== before) scheduleMembersBroadcast(room);
+}
+
 function send(ws, message) {
-  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(message));
+  if (ws.readyState !== ws.OPEN) return;
+  // Test hook: emulate a slow link for one member by delaying everything we send it.
+  if (ws.testDelayMs) {
+    setTimeout(() => {
+      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(message));
+    }, ws.testDelayMs);
+    return;
+  }
+  ws.send(JSON.stringify(message));
 }
 
 function broadcast(room, message) {
@@ -1498,6 +1579,15 @@ function broadcast(room, message) {
 
 function broadcastMembers(room) {
   broadcast(room, { type: 'members', members: distinctMembers(room) });
+}
+
+// Status flaps (buffering on/off) are coalesced so a stuttering link does not spam the room.
+function scheduleMembersBroadcast(room) {
+  if (room.membersTimer) return;
+  room.membersTimer = setTimeout(() => {
+    room.membersTimer = null;
+    if (room.members.size) broadcastMembers(room);
+  }, MEMBERS_BROADCAST_COALESCE_MS);
 }
 
 function pauseRoomWhenEmpty(room) {
@@ -1528,43 +1618,50 @@ function takeChatToken(member) {
   return true;
 }
 
-function applyState(room, user, incoming) {
+// Legacy clients only send { isPlaying, position, reason }; derive the intent from the transition.
+function controlActionOf(incoming, current) {
+  if (['play', 'pause', 'seek'].includes(incoming.action)) return incoming.action;
+  const reason = String(incoming.reason || '');
+  if (reason === 'play' || reason === 'pause' || reason === 'seek') return reason;
+  const wantsPlaying = Boolean(incoming.isPlaying);
+  if (wantsPlaying !== Boolean(current.isPlaying)) return wantsPlaying ? 'play' : 'pause';
+  const target = Number(incoming.position);
+  if (Number.isFinite(target) && Math.abs(target - current.position) > 1) return 'seek';
+  return 'noop';
+}
+
+// A control message describes an intent against the timeline — play, pause or seek — never a
+// playhead. Play and pause are transitions (a play while already playing changes nothing, so a
+// member who fell behind can never drag the room back to its position); only a seek carries a
+// position, and a pause freezes the timeline where it stood when the user pressed it, measured
+// in server time so uplink delay does not shift the room.
+function applyControl(room, member, incoming, ws) {
+  const nowMs = Date.now();
   const current = computedState(room);
-  const mediaUrl = typeof incoming.mediaUrl === 'string'
-    ? incoming.mediaUrl.trim().slice(0, 3000)
-    : typeof incoming.videoUrl === 'string'
-      ? incoming.videoUrl.trim().slice(0, 3000)
-      : current.mediaUrl || current.videoUrl || '';
-  const mediaType = safeMediaType(incoming.mediaType || current.mediaType);
-  const roomMode = safeMediaType(incoming.roomMode || current.roomMode || mediaType);
-  const position = Number.isFinite(Number(incoming.position)) ? Math.max(0, Number(incoming.position)) : current.position;
-  const isPlaying = Boolean(incoming.isPlaying);
-  const mediaMeta = incoming.mediaMeta && typeof incoming.mediaMeta === 'object' ? {
-    title: safeShortText(incoming.mediaMeta.title, 160),
-    artist: safeShortText(incoming.mediaMeta.artist, 120),
-    album: safeShortText(incoming.mediaMeta.album, 120),
-    coverUrl: safeShortText(incoming.mediaMeta.coverUrl, 3000),
-    duration: Number.isFinite(Number(incoming.mediaMeta.duration)) ? Math.max(0, Number(incoming.mediaMeta.duration)) : null,
-    lyrics: safeLyrics(incoming.mediaMeta.lyrics),
-    sourceName: safeShortText(incoming.mediaMeta.sourceName, 180)
-  } : current.mediaMeta || null;
-  const currentTrackId = 'currentTrackId' in incoming ? safeShortText(incoming.currentTrackId, 80) : safeShortText(current.currentTrackId, 80);
-  room.state = {
-    ...room.state,
-    videoUrl: mediaUrl,
-    mediaUrl,
-    mediaType,
-    roomMode,
-    playbackModes: normalizePlaybackModes(current.playbackModes),
-    isPlaying,
-    position,
-    mediaMeta: mediaType === 'audio' ? mediaMeta : null,
-    currentTrackId,
-    updatedAt: Date.now(),
-    version: current.version + 1,
-    updatedBy: user.username
-  };
-  broadcastState(room, incoming.reason || 'control');
+  const action = controlActionOf(incoming, current);
+  const anchor = Number(room.state.updatedAt) || nowMs;
+  const clientTime = Number.isFinite(Number(incoming.clientTime))
+    ? clampNumber(Number(incoming.clientTime), nowMs - SYNC_CLIENT_TIME_MAX_AGE_MS, nowMs)
+    : nowMs;
+  const target = Number.isFinite(Number(incoming.position)) ? Math.max(0, Number(incoming.position)) : null;
+  const wasPlaying = Boolean(room.state.isPlaying);
+  const base = Math.max(0, Number(room.state.position) || 0);
+  let next = null;
+  if (action === 'seek' && target !== null) {
+    next = { position: target, isPlaying: wasPlaying, updatedAt: wasPlaying ? nowMs + playLeadMs(room) : nowMs };
+  } else if (action === 'play' && !wasPlaying) {
+    next = { position: base, isPlaying: true, updatedAt: nowMs + playLeadMs(room) };
+  } else if (action === 'pause' && wasPlaying) {
+    next = { position: anchor > clientTime ? base : livePosition(room, clientTime), isPlaying: false, updatedAt: nowMs };
+  }
+  if (!next) {
+    // Nothing to apply (play while playing, pause while paused): re-send the timeline to the
+    // sender only, so a stale belief re-aligns without touching the room.
+    if (ws) send(ws, { type: 'state_sync', state: computedState(room) });
+    return;
+  }
+  room.state = { ...room.state, ...next, version: current.version + 1, updatedBy: member.username };
+  broadcastState(room, incoming.reason || action, member.connectionId);
 }
 
 server.on('upgrade', (req, socket, head) => {
@@ -1595,6 +1692,9 @@ wss.on('connection', (ws, req, payload) => {
     joinedAt: now(),
     chatTokens: CHAT_BURST,
     chatRefillAt: Date.now(),
+    rtt: null,
+    status: 'playing',
+    statusAt: Date.now(),
     ws
   };
   room.members.set(connectionId, member);
@@ -1602,16 +1702,23 @@ wss.on('connection', (ws, req, payload) => {
   ws.isAlive = true;
   ws.on('pong', () => {
     ws.isAlive = true;
+    // The protocol-level ping doubles as the node's own RTT probe for the scheduled-start lead.
+    if (ws.pingSentAt) noteMemberRtt(member, Date.now() - ws.pingSentAt, room);
   });
 
   send(ws, {
     type: 'snapshot',
     roomId: room.id,
+    connectionId,
     state: computedState(room),
     members: distinctMembers(room),
     messages: room.messages.slice(-80)
   });
   broadcastMembers(room);
+  try {
+    ws.pingSentAt = Date.now();
+    ws.ping();
+  } catch {}
 
   ws.on('message', (raw) => {
     let message;
@@ -1620,8 +1727,34 @@ wss.on('connection', (ws, req, payload) => {
     } catch {
       return;
     }
+    if (SYNC_TEST_HOOKS && message.type === 'test_delay') {
+      ws.testDelayMs = clampNumber(Number(message.ms) || 0, 0, 5000);
+      member.rttPinned = ws.testDelayMs > 0;
+      member.rtt = ws.testDelayMs > 0 ? ws.testDelayMs * 2 : member.rtt;
+      scheduleMembersBroadcast(room);
+      return;
+    }
+    const handle = () => handleMemberMessage(message);
+    if (ws.testDelayMs) setTimeout(handle, ws.testDelayMs);
+    else handle();
+  });
+
+  function handleMemberMessage(message) {
     if (message.type === 'state_update') {
-      applyState(room, member, message.state || {});
+      // New clients put the control verb and their clock reading beside the state object.
+      const incoming = { ...(message.state || {}) };
+      if (message.action !== undefined) incoming.action = message.action;
+      if (message.clientTime !== undefined) incoming.clientTime = message.clientTime;
+      applyControl(room, member, incoming, ws);
+      return;
+    }
+    if (message.type === 'member_status') {
+      const status = message.status === 'buffering' ? 'buffering' : 'playing';
+      if (member.status !== status) {
+        member.status = status;
+        member.statusAt = Date.now();
+        scheduleMembersBroadcast(room);
+      }
       return;
     }
     if (message.type === 'room_mode') {
@@ -1658,6 +1791,9 @@ wss.on('connection', (ws, req, payload) => {
       return;
     }
     if (message.type === 'latency_ping') {
+      // The node's own ws ping is the authoritative RTT; the client's measurement only fills the
+      // gap before the first pong arrives.
+      if (!Number.isFinite(member.rtt) && Number.isFinite(Number(message.rtt))) noteMemberRtt(member, message.rtt, room);
       send(ws, {
         type: 'latency_pong',
         id: String(message.id || ''),
@@ -1665,7 +1801,7 @@ wss.on('connection', (ws, req, payload) => {
         serverTime: Date.now()
       });
     }
-  });
+  }
 
   ws.on('close', () => {
     room.members.delete(connectionId);
@@ -1677,10 +1813,33 @@ wss.on('connection', (ws, req, payload) => {
   });
 });
 
+// The heartbeat carries only the timeline. Queues, modes and metadata travel on explicit `state`
+// events and the snapshot; clients keep their copies when these fields are absent.
+function slimState(room) {
+  const full = computedState(room);
+  return {
+    isPlaying: full.isPlaying,
+    position: full.position,
+    updatedAt: full.updatedAt,
+    version: full.version,
+    currentTrackId: full.currentTrackId,
+    mediaUrl: full.mediaUrl,
+    videoUrl: full.videoUrl,
+    mediaType: full.mediaType,
+    roomMode: full.roomMode,
+    updatedBy: full.updatedBy,
+    serverTime: full.serverTime
+  };
+}
+
+let heartbeatTick = 0;
 setInterval(() => {
+  heartbeatTick += 1;
   for (const room of rooms.values()) {
     if (!room.members.size) continue;
-    broadcast(room, { type: 'state_sync', state: computedState(room) });
+    // A paused timeline is static: five seconds between heartbeats is plenty.
+    if (!room.state.isPlaying && heartbeatTick % 5) continue;
+    broadcast(room, { type: 'state_sync', state: slimState(room) });
   }
 }, 1000);
 
@@ -1694,6 +1853,7 @@ setInterval(() => {
     }
     client.isAlive = false;
     try {
+      client.pingSentAt = Date.now();
       client.ping();
     } catch {
       client.terminate();

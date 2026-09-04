@@ -1132,6 +1132,7 @@ h3 {
   transition: background-color 200ms ease, box-shadow 200ms ease;
 }
 
+.sync-bar[data-mode="scheduled"] .sync-dot,
 .sync-bar[data-mode="nudging"] .sync-dot,
 .sync-bar[data-mode="catching"] .sync-dot,
 .sync-bar[data-mode="buffering"] .sync-dot,
@@ -2182,6 +2183,32 @@ body > .art-video-player.art-fullscreen-web {
 .member-chip.is-self {
   border-color: var(--claude-line);
   background: var(--claude-soft);
+}
+
+.member-chip.is-buffering {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+}
+
+.member-status {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 18%, transparent);
+  animation: member-status-pulse 1.4s ease-in-out infinite;
+}
+
+.member-latency {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+
+@keyframes member-status-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
 }
 
 .chat-panel {
