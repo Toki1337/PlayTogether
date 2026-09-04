@@ -88,6 +88,10 @@ const state = {
     noticeTimer: null
   },
   storagePath: '',
+  storageSource: '',
+  embyConnections: [],
+  emby: { connectionId: '', stack: [], search: '' },
+  embyRefreshedTrackIds: new Set(),
   adminStoragePath: '',
   admin: {
     syncNodes: [],
@@ -635,6 +639,7 @@ function switchAdminPage(page) {
 
 async function loadConfig() {
   state.config = await api('/api/config');
+  state.embyConnections = state.config.embyConnections || [];
   renderSyncSelect();
   renderStorageSelects();
   updateMetrics();
@@ -928,6 +933,7 @@ function initVideoPlayer() {
       playbackRate: true,
       aspectRatio: true,
       miniProgressBar: true,
+      subtitle: { type: 'vtt', escape: false },
       moreVideoAttr: {
         id: 'videoPlayer',
         preload: 'auto',
@@ -949,7 +955,9 @@ function initVideoPlayer() {
               lowLatencyMode: false
             });
             state.hls.on(Hls.Events.ERROR, (event, data) => {
-              if (data?.fatal) setSyncMode('error', 'HLS 无法播放');
+              if (!data?.fatal) return;
+              if (currentEmbyTrack()) handleEmbyPlaybackError();
+              else setSyncMode('error', 'HLS 无法播放');
             });
             state.hls.on(Hls.Events.MANIFEST_PARSED, () => finishSourcePreload());
             state.hls.loadSource(url);
@@ -1467,11 +1475,13 @@ function setMediaSource(url, options = {}) {
       .then(() => {
         ensureVideoVisible();
         finishSourcePreload();
+        applyEmbyEnhancements();
       })
       .catch(() => {
         state.sourceLoading = false;
         state.pendingAutoplay = false;
-        setSyncMode('error', '视频无法加载');
+        if (currentEmbyTrack()) handleEmbyPlaybackError();
+        else setSyncMode('error', '视频无法加载');
       });
   } else {
     player.src = url;
@@ -1612,7 +1622,7 @@ function renderMediaQueue() {
     handle.setAttribute('aria-label', `拖动 ${trackTitle}`);
     const cover = document.createElement('div');
     cover.className = 'queue-track-cover';
-    if (isAudioQueue && track.coverUrl) {
+    if (track.coverUrl) {
       cover.style.backgroundImage = coverImageValue(track.coverUrl);
     } else if (isAudioQueue) {
       cover.textContent = (trackTitle || '音').slice(0, 1).toUpperCase();
@@ -1938,7 +1948,20 @@ function requestRoomMode(mediaType) {
   }
 }
 
+// 'emby:<serverId>:<itemId>' -> '<serverId>:<itemId>', used to match a browser card against a
+// queued Emby track whose real mediaUrl is a per-mint node URL that never equals the card key.
+function embyKeyFromSynthetic(url) {
+  const match = /^emby:([^:]*):(.+)$/.exec(String(url || ''));
+  return match ? `${match[1]}:${match[2]}` : '';
+}
+
+function trackEmbyKey(track) {
+  return track?.source?.kind === 'emby' ? `${track.source.serverId || ''}:${track.source.itemId || ''}` : '';
+}
+
 function queuedTrackForUrl(url, mediaType) {
+  const embyKey = embyKeyFromSynthetic(url);
+  if (embyKey) return queueFor(mediaType).find((track) => trackEmbyKey(track) === embyKey) || null;
   const target = comparableMediaUrl(url);
   if (!target) return null;
   return queueFor(mediaType).find((track) => comparableMediaUrl(track.mediaUrl || track.videoUrl) === target) || null;
@@ -2184,6 +2207,8 @@ function sendChat(text) {
 
 function renderStorageSelects() {
   const nodes = state.config?.storageNodes || [];
+  // The admin/download selects only ever list storage nodes; the room's media-library select also
+  // offers the user's Emby connections and a "connect" entry.
   for (const selector of ['#storageNodeSelect', '#adminStorageSelect', '#downloadStorageSelect']) {
     const select = $(selector);
     if (!select) continue;
@@ -2195,19 +2220,55 @@ function renderStorageSelects() {
       option.textContent = node.name;
       select.appendChild(option);
     }
-    if (current && nodes.some((node) => node.id === current)) select.value = current;
+    if (selector === '#storageNodeSelect') {
+      const connections = state.embyConnections || [];
+      const group = document.createElement('optgroup');
+      group.label = 'Emby';
+      for (const conn of connections) {
+        const option = document.createElement('option');
+        option.value = `emby:${conn.id}`;
+        option.textContent = conn.name || conn.host;
+        group.appendChild(option);
+      }
+      const connect = document.createElement('option');
+      connect.value = 'emby:new';
+      connect.textContent = '连接 Emby 服务器…';
+      group.appendChild(connect);
+      select.appendChild(group);
+    }
+    const values = Array.from(select.options).map((option) => option.value);
+    if (current && values.includes(current)) select.value = current;
   }
-  if (!$('#storageNodeSelect').value && nodes[0]) $('#storageNodeSelect').value = nodes[0].id;
-  if (!$('#adminStorageSelect').value && nodes[0]) $('#adminStorageSelect').value = nodes[0].id;
-  if ($('#downloadStorageSelect') && !$('#downloadStorageSelect').value && nodes[0]) $('#downloadStorageSelect').value = nodes[0].id;
+  for (const selector of ['#adminStorageSelect', '#downloadStorageSelect']) {
+    const select = $(selector);
+    if (select && !select.value && nodes[0]) select.value = nodes[0].id;
+  }
+  const mediaSelect = $('#storageNodeSelect');
+  if (mediaSelect && !mediaSelect.value) mediaSelect.value = nodes[0] ? nodes[0].id : (state.embyConnections[0] ? `emby:${state.embyConnections[0].id}` : 'emby:new');
+  state.storageSource = mediaSelect ? mediaSelect.value : '';
   if (!nodes.length) {
-    setStorageBrowserStatus('没有可用存储节点');
-    renderEmpty('#storageFileList', '暂无媒体');
     renderEmpty('#adminFileList', '暂无存储节点');
     renderEmpty('#downloadTaskList', '暂无存储节点');
-    return;
+  }
+  if (!nodes.length && !state.embyConnections.length) {
+    setStorageBrowserStatus('没有可用存储节点，可连接 Emby 服务器');
   }
   loadStorageBrowser().catch((error) => setStorageBrowserStatus(error.message));
+}
+
+function isEmbySource(value = state.storageSource) {
+  return String(value || '').startsWith('emby:');
+}
+
+function showEmbyConnectPanel(show) {
+  const panel = $('#embyConnectPanel');
+  const grid = $('#storageFileList');
+  const searchRow = $('#embySearchRow');
+  if (panel) panel.classList.toggle('hidden', !show);
+  if (grid) grid.classList.toggle('hidden', show);
+  if (searchRow) searchRow.classList.add('hidden');
+  const pathRow = $('.storage-browser .path-row');
+  if (pathRow) pathRow.classList.toggle('hidden', show);
 }
 
 function setStorageBrowserStatus(text = '') {
@@ -2231,6 +2292,10 @@ function renderFileSkeleton(selector, count = 6) {
 async function loadStorageBrowser() {
   const nodeId = $('#storageNodeSelect').value;
   if (!nodeId) return;
+  if (isEmbySource(nodeId)) return loadEmbyBrowser(nodeId.slice(5));
+  showEmbyConnectPanel(false);
+  const searchRow = $('#embySearchRow');
+  if (searchRow) searchRow.classList.add('hidden');
   const requestKey = `${nodeId}:${state.storagePath}:${Date.now()}`;
   state.storageRequestKey = requestKey;
   setStorageBrowserStatus('');
@@ -2300,6 +2365,8 @@ function comparableMediaUrl(value) {
 }
 
 function isMediaUrlQueued(url, mediaType) {
+  const embyKey = embyKeyFromSynthetic(url);
+  if (embyKey) return queueFor(mediaType).some((track) => trackEmbyKey(track) === embyKey);
   const target = comparableMediaUrl(url);
   if (!target) return false;
   return queueFor(mediaType).some((track) => comparableMediaUrl(track.mediaUrl || track.videoUrl) === target);
@@ -2343,6 +2410,7 @@ function fileEntryLabel(entry) {
 }
 
 function fileEntryMeta(entry) {
+  if (entry.metaText !== undefined) return entry.metaText;
   if (entry.type !== 'file') return '文件夹';
   const tags = [formatBytes(entry.size)];
   if (entry.isAudio) tags.push('音频');
@@ -2425,13 +2493,39 @@ function createFileThumbnail(entry, mediaUrl, shouldHydrateAudio = false) {
     'file-thumb',
     entry.type === 'dir' ? 'dir' : '',
     entry.isAudio ? 'audio' : '',
-    entry.isVideo ? 'video' : ''
+    entry.isVideo ? 'video' : '',
+    entry.portrait ? 'poster' : ''
   ].filter(Boolean).join(' ');
-  const glyph = iconEl(entry.type === 'dir' ? 'folder' : entry.isAudio ? 'music' : entry.isVideo ? 'film' : 'file');
+  const glyph = iconEl(entry.glyph || (entry.type === 'dir' ? 'folder' : entry.isAudio ? 'music' : entry.isVideo ? 'film' : 'file'));
   glyph.classList.add('file-thumb-glyph');
   thumb.appendChild(glyph);
-  const wantsVideo = entry.type === 'file' && entry.isVideo && Boolean(mediaUrl);
-  const wantsAudio = shouldHydrateAudio && entry.isAudio;
+  // Emby entries carry a ready poster URL and a synthetic emby: media key, so never spawn a <video>
+  // preview element (its src would be the un-fetchable emby: key).
+  if (entry.posterUrl) {
+    const observer = thumbObserver();
+    const hydratePoster = () => {
+      if (!thumb.isConnected) return;
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      img.alt = '';
+      img.setAttribute('aria-hidden', 'true');
+      img.addEventListener('load', () => thumb.classList.add('has-preview'), { once: true });
+      img.addEventListener('error', () => img.remove(), { once: true });
+      img.src = entry.posterUrl;
+      thumb.insertBefore(img, thumb.firstChild);
+    };
+    if (observer) {
+      thumb._hydrate = hydratePoster;
+      observer.observe(thumb);
+    } else {
+      hydratePoster();
+    }
+    return thumb;
+  }
+  const isSynthetic = String(mediaUrl || '').startsWith('emby:');
+  const wantsVideo = entry.type === 'file' && entry.isVideo && Boolean(mediaUrl) && !isSynthetic;
+  const wantsAudio = shouldHydrateAudio && entry.isAudio && !isSynthetic;
   if (wantsVideo || wantsAudio) {
     const hydrate = () => {
       if (!thumb.isConnected) return;
@@ -2519,6 +2613,346 @@ function parentPath(rel) {
   const parts = String(rel || '').split('/').filter(Boolean);
   parts.pop();
   return parts.join('/');
+}
+
+// ---- Emby source ----------------------------------------------------------------------------
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[char]));
+}
+
+function embyGlyphFor(item) {
+  if (item.collectionType || item.type === 'CollectionFolder' || item.type === 'UserView') return 'folder';
+  if (['Series', 'Season', 'BoxSet'].includes(item.type)) return 'tv';
+  if (['Movie', 'Episode', 'Video'].includes(item.type)) return 'film';
+  return item.isFolder ? 'folder' : 'film';
+}
+
+function embyMetaText(item) {
+  if (item.type === 'Episode') {
+    const season = Number.isFinite(item.parentIndexNumber) ? `S${String(item.parentIndexNumber).padStart(2, '0')}` : '';
+    const episode = Number.isFinite(item.indexNumber) ? `E${String(item.indexNumber).padStart(2, '0')}` : '';
+    const runtime = item.runtime ? formatDuration(item.runtime) : '';
+    return [`${season}${episode}`, runtime].filter(Boolean).join(' · ') || '剧集';
+  }
+  if (item.type === 'Movie') return [item.year, item.runtime ? formatDuration(item.runtime) : ''].filter(Boolean).join(' · ') || '电影';
+  if (item.type === 'Series') return item.year ? `剧集 · ${item.year}` : '剧集';
+  if (item.type === 'Season') return '季';
+  if (item.collectionType || item.type === 'CollectionFolder' || item.type === 'UserView') return '影库';
+  return item.isFolder ? '文件夹' : '';
+}
+
+function embyItemToEntry(item) {
+  const entry = {
+    name: item.name || '未命名',
+    type: item.isFolder ? 'dir' : 'file',
+    posterUrl: item.posterUrl || '',
+    // Movies/series/seasons carry portrait posters; libraries and episodes use wide artwork.
+    portrait: ['Movie', 'Series', 'Season', 'BoxSet'].includes(item.type),
+    glyph: embyGlyphFor(item),
+    metaText: embyMetaText(item),
+    progressPercent: item.playedPercentage || 0,
+    _emby: item
+  };
+  if (!item.isFolder) {
+    entry.isVideo = true;
+    entry.isMedia = true;
+    entry.mediaType = 'video';
+    entry.mediaUrl = `emby:${state.emby.serverId || ''}:${item.id}`;
+    entry.videoUrl = entry.mediaUrl;
+  }
+  return entry;
+}
+
+function renderEmbyItems(items) {
+  const grid = $('#storageFileList');
+  if (!grid) return;
+  const usePoster = items.some((item) => ['Movie', 'Series', 'Season', 'BoxSet'].includes(item.type));
+  grid.classList.toggle('poster-grid', usePoster);
+  renderFileGrid('#storageFileList', items.map(embyItemToEntry), {
+    onDir: (entry) => {
+      state.emby.search = '';
+      const searchInput = $('#embySearchInput');
+      if (searchInput) searchInput.value = '';
+      state.emby.stack.push({ id: entry._emby.id, name: entry._emby.name, kind: entry._emby.type });
+      loadEmbyBrowser().catch((error) => toast(error.message));
+    },
+    onFile: (entry) => {
+      addEmbyTrack(entry._emby.id, { playNow: true }).catch((error) => toast(error.message));
+    },
+    onQueue: (entry) => addEmbyTrack(entry._emby.id, { playNow: false })
+  });
+}
+
+async function loadEmbyBrowser(connectionId) {
+  const id = connectionId || state.emby.connectionId;
+  if (!id) {
+    openEmbyConnect();
+    return;
+  }
+  const conn = (state.embyConnections || []).find((item) => item.id === id);
+  if (!conn) {
+    openEmbyConnect();
+    return;
+  }
+  state.emby.connectionId = id;
+  state.emby.serverId = conn.serverId || '';
+  state.storageSource = `emby:${id}`;
+  const select = $('#storageNodeSelect');
+  if (select && select.value !== state.storageSource) select.value = state.storageSource;
+  showEmbyConnectPanel(false);
+  const searchRow = $('#embySearchRow');
+  if (searchRow) searchRow.classList.remove('hidden');
+  const stack = state.emby.stack;
+  const crumb = ['Emby', ...stack.map((entry) => entry.name)].join(' / ');
+  $('#storagePathLabel').textContent = state.emby.search ? `搜索：${state.emby.search}` : crumb;
+  $('#storageBackBtn').disabled = !stack.length && !state.emby.search;
+  setStorageBrowserStatus('');
+  renderFileSkeleton('#storageFileList');
+  const requestKey = `emby:${id}:${state.emby.search}:${stack.map((entry) => entry.id).join('>')}:${Date.now()}`;
+  state.storageRequestKey = requestKey;
+  let payload;
+  try {
+    if (state.emby.search) {
+      payload = await api(`/api/emby/connections/${id}/items?search=${encodeURIComponent(state.emby.search)}&limit=80`);
+    } else if (!stack.length) {
+      payload = await api(`/api/emby/connections/${id}/views`);
+    } else {
+      const parent = stack[stack.length - 1];
+      payload = await api(`/api/emby/connections/${id}/items?parentId=${encodeURIComponent(parent.id)}&limit=100`);
+    }
+  } catch (error) {
+    if (state.storageRequestKey !== requestKey) return;
+    renderEmpty('#storageFileList', '无法读取 Emby 影库');
+    setStorageBrowserStatus(error.message);
+    return;
+  }
+  if (state.storageRequestKey !== requestKey) return;
+  renderEmbyItems(payload.items || []);
+}
+
+async function addEmbyTrack(itemId, options = {}) {
+  const connectionId = state.emby.connectionId;
+  if (!connectionId) {
+    toast('请先连接 Emby 服务器');
+    return false;
+  }
+  if (!state.currentRoom?.id) {
+    toast('请先加入房间');
+    return false;
+  }
+  requestRoomMode('video');
+  let track;
+  try {
+    ({ track } = await api(`/api/emby/connections/${connectionId}/items/${encodeURIComponent(itemId)}/track`, {
+      method: 'POST',
+      body: { roomId: state.currentRoom.id }
+    }));
+  } catch (error) {
+    toast(error.message);
+    return false;
+  }
+  const key = `${track.source?.serverId || ''}:${track.source?.itemId || ''}`;
+  const existing = queueFor('video').find((item) => trackEmbyKey(item) === key);
+  if (existing) {
+    if (options.playNow) sendQueueMessage('queue_play', { mediaType: 'video', trackId: existing.id });
+    return true;
+  }
+  return sendQueueMessage('queue_add', { mediaType: 'video', track, playNow: Boolean(options.playNow) });
+}
+
+function openEmbyConnect() {
+  showEmbyConnectPanel(true);
+  renderEmbyConnectPanel();
+}
+
+function renderEmbyConnectPanel() {
+  const list = $('#embyConnectionList');
+  if (!list) return;
+  list.innerHTML = '';
+  const connections = state.embyConnections || [];
+  if (!connections.length) {
+    renderEmpty(list, '还没有连接任何 Emby 服务器');
+    return;
+  }
+  for (const conn of connections) {
+    const item = document.createElement('div');
+    item.className = 'list-item';
+    const info = document.createElement('div');
+    const title = document.createElement('p');
+    title.className = 'item-title';
+    title.textContent = conn.name || conn.host;
+    const meta = document.createElement('p');
+    meta.className = 'item-meta';
+    meta.textContent = [conn.embyUsername, conn.host].filter(Boolean).join(' · ');
+    const status = document.createElement('span');
+    const kind = conn.lastStatus?.ok === false ? 'bad' : conn.lastStatus ? 'good' : 'muted';
+    status.className = statusClass(kind);
+    status.textContent = conn.lastStatus?.ok === false ? '离线' : conn.lastStatus ? '已连接' : '未测试';
+    info.append(title, meta, status);
+    const cluster = document.createElement('div');
+    cluster.className = 'button-cluster';
+    const openBtn = actionButton('浏览', 'secondary-pill', () => {
+      const select = $('#storageNodeSelect');
+      if (select) select.value = `emby:${conn.id}`;
+      state.emby = { connectionId: conn.id, stack: [], search: '' };
+      state.storageSource = `emby:${conn.id}`;
+      loadEmbyBrowser(conn.id).catch((error) => toast(error.message));
+    });
+    const testBtn = actionButton('测试', 'pearl-button', (event) => testEmbyConnection(conn.id, event.currentTarget));
+    const delBtn = actionButton('断开', 'pearl-button', () => disconnectEmby(conn.id));
+    cluster.append(openBtn, testBtn, delBtn);
+    item.append(info, cluster);
+    list.appendChild(item);
+  }
+}
+
+async function submitEmbyConnect(event) {
+  event.preventDefault();
+  const baseUrl = $('#embyBaseUrl').value.trim();
+  const username = $('#embyUsername').value.trim();
+  const password = $('#embyPassword').value;
+  const saved = await withBusy(
+    event.submitter,
+    async () => api('/api/emby/connections', { method: 'POST', body: { baseUrl, username, password } }),
+    '连接中'
+  );
+  if (!saved) return;
+  toast('Emby 已连接');
+  event.target.reset();
+  await loadConfig();
+  const select = $('#storageNodeSelect');
+  if (select) select.value = `emby:${saved.connection.id}`;
+  state.storageSource = `emby:${saved.connection.id}`;
+  state.emby = { connectionId: saved.connection.id, stack: [], search: '' };
+  renderEmbyConnectPanel();
+  await loadEmbyBrowser(saved.connection.id);
+}
+
+async function testEmbyConnection(id, button) {
+  const result = await withBusy(button, async () => api(`/api/emby/connections/${id}/test`, { method: 'POST' }), '测试中');
+  if (!result) return;
+  toast('Emby 连接正常');
+  await loadConfig();
+  renderEmbyConnectPanel();
+}
+
+async function disconnectEmby(id) {
+  let res;
+  try {
+    res = await api(`/api/emby/connections/${id}`, { method: 'DELETE' });
+  } catch (error) {
+    toast(error.message);
+    return;
+  }
+  toast(res.warning || 'Emby 已断开');
+  await loadConfig();
+  if (state.emby.connectionId === id) state.emby = { connectionId: '', stack: [], search: '' };
+  const select = $('#storageNodeSelect');
+  if (select && select.value === `emby:${id}`) {
+    select.value = state.config.storageNodes[0] ? state.config.storageNodes[0].id : 'emby:new';
+    state.storageSource = select.value;
+  }
+  renderEmbyConnectPanel();
+  loadStorageBrowser().catch((error) => toast(error.message));
+}
+
+function currentEmbyTrack() {
+  const track = currentTrackFromQueue('video');
+  return track?.source?.kind === 'emby' ? track : null;
+}
+
+function embyProxyBase(mediaUrl) {
+  return String(mediaUrl || '').replace(/\/(hls\/master\.m3u8|stream)(\?.*)?$/i, '');
+}
+
+function applyEmbyEnhancements() {
+  const art = state.artPlayer;
+  const track = currentTrackFromQueue('video');
+  if (art && track?.coverUrl) art.poster = track.coverUrl;
+  syncEmbySubtitles(track);
+}
+
+// Emby subtitles are per-viewer and local: the picker never touches room state, and labels are
+// escaped because they come from a member-controlled server.
+function syncEmbySubtitles(track) {
+  const art = state.artPlayer;
+  if (!art) return;
+  try {
+    art.setting.remove('emby-subtitle');
+  } catch {}
+  const subs = track?.source?.kind === 'emby' ? (track.source.subtitles || []) : [];
+  if (!subs.length) {
+    try {
+      art.subtitle.show = false;
+    } catch {}
+    return;
+  }
+  const base = embyProxyBase(track.mediaUrl);
+  const options = [{ default: true, html: '关闭', url: '' }].concat(subs.map((sub) => ({
+    html: escapeHtml(sub.label || `字幕 ${sub.index}`),
+    url: `${base}/sub/${sub.index}`,
+    default: false
+  })));
+  const preferred = subs.find((sub) => sub.isDefault) || subs.find((sub) => /zh|chi|中/i.test(`${sub.language}${sub.label}`));
+  art.setting.add({
+    name: 'emby-subtitle',
+    html: '字幕',
+    tooltip: preferred ? (preferred.label || '字幕') : '关闭',
+    selector: options,
+    onSelect(item) {
+      if (item.url) {
+        art.subtitle.switch(item.url, { type: 'vtt' });
+        art.subtitle.show = true;
+      } else {
+        art.subtitle.show = false;
+      }
+      return item.html;
+    }
+  });
+  if (preferred) {
+    art.subtitle.switch(`${base}/sub/${preferred.index}`, { type: 'vtt' });
+    art.subtitle.show = true;
+  } else {
+    try {
+      art.subtitle.show = false;
+    } catch {}
+  }
+}
+
+async function handleEmbyPlaybackError() {
+  const track = currentEmbyTrack();
+  if (!track) return false;
+  const base = embyProxyBase(track.mediaUrl);
+  try {
+    await api(`${base}/probe`);
+    // The proxy reached Emby fine, so the failure is codec/format, not authorization.
+    setSyncMode('error', '此影片无法在浏览器播放');
+    return true;
+  } catch (error) {
+    if (/HTML 页面|Cannot GET|接口不存在|404/.test(error.message)) {
+      setSyncMode('error', '存储节点版本过旧，请在后台更新节点');
+      return true;
+    }
+    const connectionId = track.source.connectionId;
+    const mine = (state.embyConnections || []).some((conn) => conn.id === connectionId);
+    if (mine && !state.embyRefreshedTrackIds.has(track.id)) {
+      state.embyRefreshedTrackIds.add(track.id);
+      try {
+        const fresh = await api(`/api/emby/connections/${connectionId}/items/${encodeURIComponent(track.source.itemId)}/track`, {
+          method: 'POST',
+          body: { roomId: state.currentRoom?.id }
+        });
+        setSyncMode('loading');
+        sendQueueMessage('queue_update', { mediaType: 'video', trackId: track.id, patch: { mediaUrl: fresh.track.mediaUrl } });
+        return true;
+      } catch {}
+    }
+    setSyncMode('error', 'Emby 授权已失效，请连接者重新登录');
+    return true;
+  }
 }
 
 function formatBytes(bytes) {
@@ -3784,6 +4218,10 @@ function bindEvents() {
       };
       state.sourceLoading = false;
       state.pendingAutoplay = false;
+      if (currentEmbyTrack()) {
+        handleEmbyPlaybackError();
+        return;
+      }
       setSyncMode('error', labels[code] || '视频无法加载');
     });
     bindPlayerEvent('durationchange', () => {
@@ -4006,15 +4444,45 @@ function bindEvents() {
       $('#chatInput').focus();
     });
   }
-  $('#storageNodeSelect').addEventListener('change', () => {
+  $('#storageNodeSelect').addEventListener('change', (event) => {
+    const value = event.target.value;
+    if (value === 'emby:new') {
+      event.target.value = state.storageSource || '';
+      openEmbyConnect();
+      return;
+    }
+    state.storageSource = value;
     state.storagePath = '';
+    if (isEmbySource(value)) {
+      const connectionId = value.slice(5);
+      if (state.emby.connectionId !== connectionId) state.emby = { connectionId, stack: [], search: '' };
+    }
     loadStorageBrowser().catch((error) => toast(error.message));
   });
   $('#refreshStorageBrowserBtn').addEventListener('click', () => loadStorageBrowser().catch((error) => toast(error.message)));
   $('#storageBackBtn').addEventListener('click', () => {
+    if (isEmbySource()) {
+      if (state.emby.search) state.emby.search = '';
+      else state.emby.stack.pop();
+      loadEmbyBrowser().catch((error) => toast(error.message));
+      return;
+    }
     state.storagePath = parentPath(state.storagePath);
     loadStorageBrowser().catch((error) => toast(error.message));
   });
+  const embySearch = $('#embySearchInput');
+  if (embySearch) {
+    embySearch.addEventListener('input', () => {
+      clearTimeout(state.emby.searchTimer);
+      state.emby.searchTimer = setTimeout(() => {
+        state.emby.search = embySearch.value.trim();
+        state.emby.stack = [];
+        loadEmbyBrowser().catch((error) => toast(error.message));
+      }, 300);
+    });
+  }
+  const embyForm = $('#embyConnectForm');
+  if (embyForm) embyForm.addEventListener('submit', submitEmbyConnect);
 
   $('#syncNodeForm').addEventListener('submit', async (event) => {
     event.preventDefault();

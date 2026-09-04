@@ -189,6 +189,9 @@ i.icon,
 .icon-film { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3 5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zm2 0v2h2V5zm12 0v2h2V5zM5 9v2h2V9zm12 0v2h2V9zM5 13v2h2v-2zm12 0v2h2v-2zM5 17v2h2v-2zm12 0v2h2v-2zM9 5v14h6V5z'/%3E%3C/svg%3E"); }
 .icon-send { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M12 4l-7 7 1.4 1.4L11 7.8V20h2V7.8l4.6 4.6L19 11z'/%3E%3C/svg%3E"); }
 .icon-file { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 2h8l6 6v14H6zm7 1.5V9h5.5z'/%3E%3C/svg%3E"); }
+.icon-search { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M10 4a6 6 0 1 0 3.7 10.72l4.29 4.28 1.41-1.41-4.28-4.29A6 6 0 0 0 10 4zm0 2a4 4 0 1 1 0 8 4 4 0 0 1 0-8z'/%3E%3C/svg%3E"); }
+.icon-tv { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3 5h18a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1h-6v2H9v-2H3a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1zm1 2v9h16V7z'/%3E%3C/svg%3E"); }
+.icon-server { --icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M4 4h16a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm3 3.5h2v-1H7zm-3 6h16a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1zm3 3.5h2v-1H7z'/%3E%3C/svg%3E"); }
 
 /* ---------------------------------------------------------------------------------------------
    Buttons
@@ -1986,6 +1989,51 @@ body > .art-video-player.art-fullscreen-web {
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.file-grid.poster-grid {
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+}
+
+.file-grid.poster-grid .file-entry {
+  contain-intrinsic-size: 0 280px;
+}
+
+.file-thumb.poster {
+  aspect-ratio: 2 / 3;
+  background: linear-gradient(150deg, var(--kraft), var(--manilla));
+}
+
+.file-thumb img {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0;
+  transition: opacity 220ms var(--ease);
+}
+
+.file-thumb.has-preview img {
+  opacity: 1;
+}
+
+.emby-search {
+  margin-bottom: 14px;
+}
+
+.emby-search input {
+  min-height: 38px;
+}
+
+.emby-connect {
+  display: grid;
+  gap: 18px;
+}
+
+.emby-connect .form-grid {
+  margin: 0;
 }
 
 .file-action {

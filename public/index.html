@@ -7,10 +7,10 @@
   <meta name="color-scheme" content="light">
   <title>PlayTogether</title>
   <link rel="icon" type="image/webp" href="/material/xiuzhen.webp?v=20260513-icon1">
-  <link rel="stylesheet" href="/styles.css?v=20260904-claude1">
+  <link rel="stylesheet" href="/styles.css?v=20260904-emby1">
   <script src="/vendor/artplayer.js"></script>
   <script src="/vendor/hls.js"></script>
-  <script defer src="/app.js?v=20260904-claude1"></script>
+  <script defer src="/app.js?v=20260904-emby1"></script>
 </head>
 <body>
   <nav class="global-nav">
@@ -169,8 +169,30 @@
                 <button id="storageBackBtn" class="pearl-button icon-only" type="button" aria-label="上级目录" title="上级目录"><i class="icon icon-back" aria-hidden="true"></i></button>
                 <span id="storagePathLabel">/</span>
               </div>
+              <div id="embySearchRow" class="path-row emby-search hidden">
+                <input id="embySearchInput" class="url-input" type="search" placeholder="搜索电影 / 剧集" aria-label="搜索 Emby">
+              </div>
               <p id="storageBrowserStatus" class="panel-note hidden"></p>
               <div id="storageFileList" class="file-grid"></div>
+              <div id="embyConnectPanel" class="emby-connect hidden">
+                <form id="embyConnectForm" class="form-grid" autocomplete="off">
+                  <label class="field wide">
+                    <span>服务器地址</span>
+                    <input id="embyBaseUrl" class="url-input" placeholder="https://emby.example.com:8096" required>
+                  </label>
+                  <label class="field">
+                    <span>用户名</span>
+                    <input id="embyUsername" autocomplete="username" required>
+                  </label>
+                  <label class="field">
+                    <span>密码</span>
+                    <input id="embyPassword" type="password" autocomplete="current-password">
+                  </label>
+                  <p class="form-message wide"></p>
+                  <button class="primary-pill wide" type="submit">连接</button>
+                </form>
+                <div id="embyConnectionList" class="list-stack"></div>
+              </div>
               <details class="direct-link-menu">
                 <summary>直链</summary>
                 <div class="control-strip">

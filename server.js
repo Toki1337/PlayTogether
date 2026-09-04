@@ -64,10 +64,44 @@ const UPLOAD_TMP_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_MAX_PER_USER = 10;
 const LOGIN_MAX_PER_IP = 60;
+const EMBY_CONNECT_WINDOW_MS = 15 * 60 * 1000;
+const EMBY_CONNECT_MAX = 20;
+const EMBY_CLIENT_NAME = 'PlayTogether';
+const EMBY_CLIENT_VERSION = '1.0.0';
+const EMBY_GRANT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const EMBY_MAX_BITRATE = 40000000;
+// One compact device profile shared by the browse/sign path (main site) and the HLS proxy (node).
+// Direct-play only the containers a browser reliably decodes; everything else is transcoded to HLS.
+// HEVC stays off the direct-play list so machines without hardware decode do not get a black frame.
+const EMBY_DEVICE_PROFILE = {
+  MaxStreamingBitrate: EMBY_MAX_BITRATE,
+  MaxStaticBitrate: EMBY_MAX_BITRATE,
+  DirectPlayProfiles: [
+    { Container: 'mp4,m4v,mov', Type: 'Video', VideoCodec: 'h264,av1', AudioCodec: 'aac,mp3,opus,flac,ac3' },
+    { Container: 'webm', Type: 'Video', VideoCodec: 'vp8,vp9,av1', AudioCodec: 'opus,vorbis' }
+  ],
+  TranscodingProfiles: [
+    {
+      Container: 'ts', Type: 'Video', Protocol: 'hls', VideoCodec: 'h264', AudioCodec: 'aac,mp3',
+      Context: 'Streaming', MaxAudioChannels: '2', MinSegments: '1', BreakOnNonKeyFrames: true
+    }
+  ],
+  SubtitleProfiles: [
+    { Format: 'vtt', Method: 'External' },
+    { Format: 'srt', Method: 'External' },
+    { Format: 'subrip', Method: 'External' },
+    { Format: 'ass', Method: 'External' },
+    { Format: 'ssa', Method: 'External' },
+    { Format: 'pgssub', Method: 'Encode' },
+    { Format: 'dvdsub', Method: 'Encode' }
+  ]
+};
 const mediaCoverCache = new Map();
 const neteaseLyricsCache = new Map();
 const mediaMetadataCache = new Map();
 const loginAttempts = new Map();
+const embyConnectAttempts = new Map();
+const embyNodeHealthCache = new Map();
 let musicMetadataImport = null;
 
 function randomId(prefix) {
@@ -268,6 +302,7 @@ function loadDb() {
     rooms: [],
     syncNodes: [],
     storageNodes: [],
+    embyConnections: [],
     authMethods: [],
     dnsProviders: [],
     installJobs: [],
@@ -293,6 +328,7 @@ function publicUser(user) {
 }
 
 function ensureSeedData() {
+  if (!Array.isArray(db.embyConnections)) db.embyConnections = [];
   if (!Array.isArray(db.dnsProviders)) db.dnsProviders = [];
   if (!Array.isArray(db.authMethods)) db.authMethods = [];
   if (!Array.isArray(db.installJobs)) db.installJobs = [];
@@ -697,6 +733,236 @@ function decryptSecret(value) {
     decipher.update(Buffer.from(dataPart, 'base64url')),
     decipher.final()
   ]).toString('utf8');
+}
+
+// ---- Emby / Jellyfin source ------------------------------------------------------------------
+// A user logs into their own Emby server; the access token is encrypted at rest and never leaves
+// the server. When a title is queued the main site mints a stateless, encrypted "grant" that a
+// storage node can open to proxy the stream, so room members watch without an Emby account and
+// never see the token or the server address.
+
+const embyGrantKey = crypto.createHash('sha256').update(secrets.nodeSecret).digest();
+
+// Grant payload is a compact positional array to keep the URL segment short.
+// [baseUrl, token, deviceId, embyUserId, itemId, mediaSourceId, roomId, priv, exp]
+function mintEmbyGrant(fields) {
+  const payload = [
+    fields.baseUrl,
+    fields.token,
+    fields.deviceId,
+    fields.embyUserId,
+    fields.itemId,
+    fields.mediaSourceId || '',
+    fields.roomId || '',
+    fields.priv ? 1 : 0,
+    fields.exp || (Date.now() + EMBY_GRANT_TTL_MS)
+  ];
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', embyGrantKey, iv);
+  const data = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `v1.${iv.toString('base64url')}.${tag.toString('base64url')}.${data.toString('base64url')}`;
+}
+
+function embyImageSignature(connId, itemId, type, tag) {
+  return crypto.createHmac('sha256', secrets.encryptionKey)
+    .update(`${connId}:${itemId}:${type}:${tag || ''}`)
+    .digest('base64url')
+    .slice(0, 32);
+}
+
+function safeEmbyConnection(conn) {
+  let host = '';
+  try {
+    host = new URL(conn.baseUrl).host;
+  } catch {
+    host = conn.baseUrl || '';
+  }
+  return {
+    id: conn.id,
+    name: conn.name || host,
+    host,
+    baseUrl: conn.baseUrl,
+    serverType: conn.serverType || 'emby',
+    serverId: conn.serverId || '',
+    embyUsername: conn.embyUsername || '',
+    lastStatus: conn.lastStatus || null,
+    createdAt: conn.createdAt
+  };
+}
+
+function embyConnectionsForUser(userId) {
+  return db.embyConnections.filter((conn) => conn.userId === userId);
+}
+
+function findEmbyConnection(id, userId) {
+  const conn = db.embyConnections.find((item) => item.id === id);
+  if (!conn) throw Object.assign(new Error('Emby 连接不存在。'), { status: 404, expose: true });
+  if (userId && conn.userId !== userId) throw Object.assign(new Error('无权访问该 Emby 连接。'), { status: 403, expose: true });
+  return conn;
+}
+
+function embyConnectionIsPrivate(conn) {
+  return db.users.find((user) => user.id === conn.userId)?.role === 'admin';
+}
+
+function embyAuthHeaderValue(deviceId, token) {
+  const parts = [
+    `Client="${encodeURIComponent(EMBY_CLIENT_NAME)}"`,
+    `Device="${encodeURIComponent(EMBY_CLIENT_NAME)}"`,
+    `DeviceId="${encodeURIComponent(deviceId || 'playtogether')}"`,
+    `Version="${encodeURIComponent(EMBY_CLIENT_VERSION)}"`
+  ];
+  if (token) parts.push(`Token="${encodeURIComponent(token)}"`);
+  return `MediaBrowser ${parts.join(', ')}`;
+}
+
+function embyHeaders(deviceId, token) {
+  const value = embyAuthHeaderValue(deviceId, token);
+  const headers = {
+    Authorization: value,
+    'X-Emby-Authorization': value,
+    Accept: 'application/json'
+  };
+  if (token) headers['X-Emby-Token'] = token;
+  return headers;
+}
+
+async function assertEmbyHttpUrl(urlString, allowPrivate) {
+  try {
+    return await assertPublicHttpUrl(urlString, allowPrivate);
+  } catch (error) {
+    const message = String(error.message || '').replace(/音频地址/g, 'Emby 地址');
+    throw Object.assign(new Error(message || 'Emby 地址不合法。'), { status: error.status || 400, expose: true });
+  }
+}
+
+async function embyFetchJson(conn, pathname, options = {}) {
+  const allowPrivate = options.allowPrivate ?? embyConnectionIsPrivate(conn);
+  await assertEmbyHttpUrl(conn.baseUrl, allowPrivate);
+  const url = new URL(pathname.replace(/^\//, ''), `${conn.baseUrl.replace(/\/+$/, '')}/`);
+  for (const [key, value] of Object.entries(options.query || {})) {
+    if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, value);
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeout || 12000);
+  const token = options.token ?? (conn.accessTokenCipher ? decryptSecret(conn.accessTokenCipher) : '');
+  try {
+    const response = await fetch(url, {
+      method: options.method || 'GET',
+      headers: {
+        ...embyHeaders(conn.deviceId, token),
+        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(options.headers || {})
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined,
+      redirect: 'manual',
+      signal: controller.signal
+    });
+    if (response.status >= 300 && response.status < 400) {
+      throw Object.assign(new Error('Emby 地址发生了重定向，请填写最终地址。'), { status: 502, expose: true });
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw Object.assign(new Error('Emby 授权已失效，请重新连接。'), { status: 401, expose: true });
+    }
+    const text = await response.text();
+    let body = {};
+    if (text) {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        throw Object.assign(new Error(`Emby 返回了非 JSON 内容（HTTP ${response.status}）。`), { status: 502, expose: true });
+      }
+    }
+    if (!response.ok) {
+      throw Object.assign(new Error(body.error || `Emby 返回 HTTP ${response.status}。`), { status: response.status, expose: true });
+    }
+    return body;
+  } catch (error) {
+    if (error.status) throw error;
+    if (error.name === 'AbortError' || /aborted/i.test(String(error.message))) {
+      throw Object.assign(new Error('Emby 服务器响应超时。'), { status: 504, expose: true });
+    }
+    const detail = [error.cause?.code, error.cause?.message, error.message].filter(Boolean).join(' ');
+    if (/CERT_|certificate|self-signed|unable to verify/i.test(detail)) {
+      throw Object.assign(new Error('Emby 证书校验失败（自签名证书需要用可信证书或 HTTP 地址）。'), { status: 502, expose: true });
+    }
+    throw Object.assign(new Error(`无法连接 Emby 服务器：${error.cause?.code || error.message}`), { status: 502, expose: true });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function embyTicksToSeconds(ticks) {
+  const value = Number(ticks);
+  return Number.isFinite(value) && value > 0 ? Math.round(value / 1e7) : 0;
+}
+
+function normalizeEmbyItem(raw, conn) {
+  const type = String(raw.Type || '');
+  const isFolder = Boolean(raw.IsFolder) || ['CollectionFolder', 'Series', 'Season', 'BoxSet', 'Folder', 'UserView'].includes(type);
+  let imageItemId = raw.Id;
+  let imageTag = raw.ImageTags?.Primary || '';
+  if (!imageTag && raw.SeriesPrimaryImageTag && raw.SeriesId) {
+    imageItemId = raw.SeriesId;
+    imageTag = raw.SeriesPrimaryImageTag;
+  }
+  let posterUrl = '';
+  if (imageTag) {
+    const sig = embyImageSignature(conn.id, imageItemId, 'Primary', imageTag);
+    const params = new URLSearchParams({ type: 'Primary', tag: imageTag, maxWidth: '400', sig });
+    posterUrl = `/api/emby/images/${encodeURIComponent(conn.id)}/${encodeURIComponent(imageItemId)}?${params.toString()}`;
+  }
+  const runtime = embyTicksToSeconds(raw.RunTimeTicks);
+  const positionTicks = Number(raw.UserData?.PlaybackPositionTicks) || 0;
+  return {
+    id: raw.Id,
+    name: raw.Name || '',
+    type,
+    collectionType: raw.CollectionType || '',
+    isFolder,
+    runtime,
+    year: Number(raw.ProductionYear) || null,
+    indexNumber: Number.isFinite(Number(raw.IndexNumber)) ? Number(raw.IndexNumber) : null,
+    parentIndexNumber: Number.isFinite(Number(raw.ParentIndexNumber)) ? Number(raw.ParentIndexNumber) : null,
+    seriesName: raw.SeriesName || '',
+    seasonName: raw.SeasonName || '',
+    overview: String(raw.Overview || '').slice(0, 600),
+    aspectRatio: Number(raw.PrimaryImageAspectRatio) || null,
+    posterUrl,
+    played: Boolean(raw.UserData?.Played),
+    playedPercentage: Number(raw.UserData?.PlayedPercentage) || (runtime && positionTicks ? Math.min(100, (positionTicks / 1e7 / runtime) * 100) : 0),
+    positionSeconds: embyTicksToSeconds(positionTicks)
+  };
+}
+
+function embyConnectAttemptKeys(req, userId) {
+  return [
+    { key: `ip:${req.ip || 'unknown'}` },
+    { key: `user:${userId || 'unknown'}` }
+  ];
+}
+
+function assertEmbyConnectAllowed(req, userId) {
+  const nowMs = Date.now();
+  for (const [key, entry] of embyConnectAttempts) {
+    if (entry.resetAt <= nowMs) embyConnectAttempts.delete(key);
+  }
+  for (const { key } of embyConnectAttemptKeys(req, userId)) {
+    const entry = embyConnectAttempts.get(key);
+    if (entry && entry.count >= EMBY_CONNECT_MAX) {
+      const minutes = Math.max(1, Math.ceil((entry.resetAt - nowMs) / 60000));
+      throw Object.assign(new Error(`连接尝试过于频繁，请 ${minutes} 分钟后再试。`), { status: 429, expose: true });
+    }
+  }
+}
+
+function recordEmbyConnectFailure(req, userId) {
+  for (const { key } of embyConnectAttemptKeys(req, userId)) {
+    const entry = embyConnectAttempts.get(key);
+    if (entry && entry.resetAt > Date.now()) entry.count += 1;
+    else embyConnectAttempts.set(key, { count: 1, resetAt: Date.now() + EMBY_CONNECT_WINDOW_MS });
+  }
 }
 
 function cleanRelativePath(input) {
@@ -2925,6 +3191,7 @@ app.get('/api/config', requireAuth, (req, res) => {
   res.json({
     syncNodes: enabledSyncNodes.map((node) => safeSyncNode(req, node)),
     storageNodes: enabledStorageNodes.map((node) => safeStorageNode(req, node)),
+    embyConnections: embyConnectionsForUser(req.user.id).map(safeEmbyConnection),
     defaultSyncNodeId: enabledSyncNodes.find((node) => node.isDefault)?.id || null,
     stats: {
       rooms: db.rooms.length,
@@ -2987,6 +3254,337 @@ app.get('/api/storage/nodes/:id/list', requireAuth, asyncRoute(async (req, res) 
   const node = db.storageNodes.find((item) => item.id === req.params.id && item.enabled);
   if (!node) return res.status(404).json({ error: '存储节点不存在或未启用。' });
   res.json(await listStorageNode(req, node, req.query.path || ''));
+}));
+
+// ---- Emby / Jellyfin routes ------------------------------------------------------------------
+
+app.get('/api/emby/connections', requireAuth, (req, res) => {
+  res.json({ connections: embyConnectionsForUser(req.user.id).map(safeEmbyConnection) });
+});
+
+app.post('/api/emby/connections', requireAuth, asyncRoute(async (req, res) => {
+  assertEmbyConnectAllowed(req, req.user.id);
+  const baseUrl = normalizeBaseUrl(req.body.baseUrl);
+  const username = String(req.body.username || '').trim();
+  const password = String(req.body.password ?? '');
+  if (!baseUrl) return res.status(400).json({ error: '请填写 Emby 服务器地址。' });
+  if (!username) return res.status(400).json({ error: '请填写 Emby 用户名。' });
+  const allowPrivate = req.user.role === 'admin';
+  const probe = { baseUrl, deviceId: randomId('pt').replace('pt_', 'pt'), serverType: 'emby', userId: req.user.id };
+  let info;
+  let auth;
+  let stage = 'url';
+  try {
+    await assertEmbyHttpUrl(baseUrl, allowPrivate);
+    stage = 'probe';
+    info = await embyFetchJson(probe, '/System/Info/Public', { allowPrivate, token: '' });
+    stage = 'auth';
+    auth = await embyFetchJson(
+      { ...probe, serverType: /jellyfin/i.test(String(info.ProductName || '')) ? 'jellyfin' : 'emby' },
+      '/Users/AuthenticateByName',
+      { method: 'POST', body: { Username: username, Pw: password }, allowPrivate, token: '' }
+    );
+  } catch (error) {
+    // Every failed attempt counts, including bad addresses, so the endpoint cannot be used to
+    // hammer third-party servers or probe the network.
+    recordEmbyConnectFailure(req, req.user.id);
+    if (stage === 'auth' && error.status === 401) {
+      throw Object.assign(new Error('Emby 用户名或密码错误。'), { status: 401, expose: true });
+    }
+    throw error;
+  }
+  const serverType = /jellyfin/i.test(String(info.ProductName || '')) ? 'jellyfin' : 'emby';
+  const accessToken = auth.AccessToken;
+  const embyUserId = auth.User?.Id;
+  if (!accessToken || !embyUserId) {
+    recordEmbyConnectFailure(req, req.user.id);
+    return res.status(502).json({ error: 'Emby 未返回访问令牌。' });
+  }
+  const serverId = info.Id || auth.ServerId || '';
+  const name = info.ServerName || auth.User?.ServerName || new URL(baseUrl).host;
+  const record = {
+    id: randomId('emby'),
+    userId: req.user.id,
+    name,
+    baseUrl,
+    serverType,
+    serverId,
+    embyUserId,
+    embyUsername: auth.User?.Name || username,
+    deviceId: probe.deviceId,
+    accessTokenCipher: encryptSecret(accessToken),
+    createdAt: now(),
+    updatedAt: now(),
+    lastStatus: { ok: true, latencyMs: 0, version: info.Version || '', checkedAt: now() }
+  };
+  // Replace an existing connection to the same server for this user rather than stacking tokens.
+  const existingIndex = db.embyConnections.findIndex(
+    (item) => item.userId === req.user.id && ((serverId && item.serverId === serverId) || item.baseUrl === baseUrl)
+  );
+  if (existingIndex >= 0) {
+    record.id = db.embyConnections[existingIndex].id;
+    record.createdAt = db.embyConnections[existingIndex].createdAt;
+    db.embyConnections[existingIndex] = record;
+  } else {
+    db.embyConnections.push(record);
+  }
+  saveDb();
+  res.json({ connection: safeEmbyConnection(record) });
+}));
+
+app.post('/api/emby/connections/:id/test', requireAuth, asyncRoute(async (req, res) => {
+  const conn = findEmbyConnection(req.params.id, req.user.id);
+  const startedAt = Date.now();
+  try {
+    const info = await embyFetchJson(conn, '/System/Info', {});
+    conn.lastStatus = { ok: true, latencyMs: Date.now() - startedAt, version: info.Version || '', checkedAt: now() };
+  } catch (error) {
+    conn.lastStatus = { ok: false, latencyMs: Date.now() - startedAt, error: error.message, checkedAt: now() };
+    saveDb();
+    throw error;
+  }
+  saveDb();
+  res.json({ ok: true, status: conn.lastStatus });
+}));
+
+app.delete('/api/emby/connections/:id', requireAuth, asyncRoute(async (req, res) => {
+  const conn = findEmbyConnection(req.params.id, req.user.id);
+  let warning = '';
+  try {
+    await embyFetchJson(conn, '/Sessions/Logout', { method: 'POST', timeout: 6000 });
+  } catch {
+    warning = '已在本站移除，但注销 Emby 令牌失败，建议在 Emby 后台手动登出该设备。';
+  }
+  db.embyConnections = db.embyConnections.filter((item) => item.id !== conn.id);
+  saveDb();
+  res.json({ ok: true, warning });
+}));
+
+app.get('/api/emby/connections/:id/views', requireAuth, asyncRoute(async (req, res) => {
+  const conn = findEmbyConnection(req.params.id, req.user.id);
+  const data = await embyFetchJson(conn, `/Users/${encodeURIComponent(conn.embyUserId)}/Views`, {});
+  const allowed = new Set(['movies', 'tvshows', 'homevideos', 'boxsets', 'playlists', 'mixed', '']);
+  const items = (data.Items || [])
+    .filter((raw) => allowed.has(String(raw.CollectionType || '').toLowerCase()))
+    .map((raw) => normalizeEmbyItem(raw, conn));
+  res.json({ items });
+}));
+
+app.get('/api/emby/connections/:id/items', requireAuth, asyncRoute(async (req, res) => {
+  const conn = findEmbyConnection(req.params.id, req.user.id);
+  const search = String(req.query.search || '').trim();
+  const parentId = String(req.query.parentId || '').trim();
+  const start = Math.max(0, Number(req.query.start) || 0);
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 60));
+  const query = {
+    Fields: 'Overview,ProductionYear,RunTimeTicks,IndexNumber,ParentIndexNumber,SeriesName,SeasonName,SeriesId,SeriesPrimaryImageTag,PrimaryImageAspectRatio,UserData,MediaSourceCount',
+    ImageTypeLimit: 1,
+    EnableImageTypes: 'Primary,Thumb',
+    StartIndex: start,
+    Limit: limit
+  };
+  if (search) {
+    query.SearchTerm = search;
+    query.Recursive = 'true';
+    query.IncludeItemTypes = 'Movie,Series,Episode';
+    query.SortBy = 'SortName';
+  } else if (parentId) {
+    query.ParentId = parentId;
+    query.SortBy = 'IndexNumber,SortName';
+  } else {
+    query.SortBy = 'SortName';
+  }
+  const data = await embyFetchJson(conn, `/Users/${encodeURIComponent(conn.embyUserId)}/Items`, { query });
+  res.json({
+    items: (data.Items || []).map((raw) => normalizeEmbyItem(raw, conn)),
+    total: Number(data.TotalRecordCount) || (data.Items || []).length
+  });
+}));
+
+// Covers are shown to the whole room, so ownership is not required here: the HMAC signature (only
+// the owner's browse responses carry it) is what prevents enumerating someone else's library.
+app.get('/api/emby/images/:connId/:itemId', requireAuth, asyncRoute(async (req, res) => {
+  const conn = findEmbyConnection(req.params.connId);
+  const type = ['Primary', 'Thumb', 'Backdrop'].includes(String(req.query.type)) ? String(req.query.type) : 'Primary';
+  const tag = String(req.query.tag || '');
+  const expected = embyImageSignature(conn.id, req.params.itemId, type, tag);
+  if (String(req.query.sig || '') !== expected) return res.status(403).json({ error: '图片签名无效。' });
+  const maxWidth = Math.min(800, Math.max(80, Number(req.query.maxWidth) || 400));
+  const allowPrivate = embyConnectionIsPrivate(conn);
+  await assertEmbyHttpUrl(conn.baseUrl, allowPrivate);
+  const token = conn.accessTokenCipher ? decryptSecret(conn.accessTokenCipher) : '';
+  const url = new URL(`Items/${encodeURIComponent(req.params.itemId)}/Images/${type}`, `${conn.baseUrl.replace(/\/+$/, '')}/`);
+  url.searchParams.set('maxWidth', String(maxWidth));
+  if (tag) url.searchParams.set('tag', tag);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const upstream = await fetch(url, { headers: embyHeaders(conn.deviceId, token), redirect: 'manual', signal: controller.signal });
+    if (!upstream.ok || !/^image\//i.test(upstream.headers.get('content-type') || '')) {
+      return res.status(502).json({ error: '无法获取封面。' });
+    }
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+    if (buffer.length > 2 * 1024 * 1024) return res.status(502).json({ error: '封面过大。' });
+    res.setHeader('Content-Type', upstream.headers.get('content-type'));
+    res.setHeader('Cache-Control', 'private, max-age=86400');
+    res.send(buffer);
+  } catch (error) {
+    if (!res.headersSent) res.status(502).json({ error: '无法获取封面。' });
+  } finally {
+    clearTimeout(timer);
+  }
+}));
+
+function urlHost(value) {
+  try {
+    return new URL(value).host.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+async function embyProxyNodeHealth(node) {
+  const cached = embyNodeHealthCache.get(node.id);
+  if (cached && Date.now() - cached.at < 60000) return cached;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+  let result = { at: Date.now(), ok: false, features: [] };
+  try {
+    const response = await fetch(`${normalizeBaseUrl(node.url)}/health`, { signal: controller.signal });
+    const body = await response.json().catch(() => ({}));
+    result = { at: Date.now(), ok: response.ok && Boolean(body.ok), features: Array.isArray(body.features) ? body.features : [] };
+  } catch {
+    result = { at: Date.now(), ok: false, features: [] };
+  } finally {
+    clearTimeout(timer);
+  }
+  embyNodeHealthCache.set(node.id, result);
+  return result;
+}
+
+// Emby playback is proxied by a remote storage node, never the main site. Prefer a node on the
+// same host as the room's sync node, and confirm it is online and new enough (emby-proxy feature).
+async function pickEmbyProxyNode(req, room) {
+  const candidates = db.storageNodes.filter((node) => node.enabled && (node.type || 'remote') !== 'local' && node.url);
+  if (!candidates.length) {
+    throw Object.assign(new Error('没有可用于代理 Emby 播放的远程存储节点，请在后台添加。'), { status: 409, expose: true });
+  }
+  const syncNode = db.syncNodes.find((node) => node.id === room.syncNodeId);
+  const syncHost = syncNode ? urlHost(safeSyncNode(req, syncNode).url) : '';
+  const ordered = [...candidates].sort((a, b) => {
+    const aSame = urlHost(safeStorageNode(req, a).url) === syncHost ? 0 : 1;
+    const bSame = urlHost(safeStorageNode(req, b).url) === syncHost ? 0 : 1;
+    return aSame - bSame;
+  });
+  let sawOnline = false;
+  for (const node of ordered) {
+    const health = await embyProxyNodeHealth(node);
+    if (!health.ok) continue;
+    sawOnline = true;
+    if (health.features.includes('emby-proxy')) return node;
+  }
+  if (sawOnline) throw Object.assign(new Error('存储节点版本过旧，请在后台更新节点后再试。'), { status: 409, expose: true });
+  throw Object.assign(new Error('没有在线的远程存储节点来代理 Emby 播放。'), { status: 409, expose: true });
+}
+
+function embyTrackTitle(item) {
+  if (item.Type === 'Episode') {
+    const season = Number.isFinite(Number(item.ParentIndexNumber)) ? `S${String(item.ParentIndexNumber).padStart(2, '0')}` : '';
+    const episode = Number.isFinite(Number(item.IndexNumber)) ? `E${String(item.IndexNumber).padStart(2, '0')}` : '';
+    const tag = [season, episode].join('');
+    return [item.SeriesName, tag, item.Name].filter(Boolean).join(' ');
+  }
+  return item.Name || '未命名视频';
+}
+
+app.post('/api/emby/connections/:id/items/:itemId/track', requireAuth, asyncRoute(async (req, res) => {
+  const conn = findEmbyConnection(req.params.id, req.user.id);
+  const room = db.rooms.find((item) => item.id === String(req.body.roomId || ''));
+  if (!room) return res.status(404).json({ error: '房间不存在。' });
+  const itemId = req.params.itemId;
+  const node = await pickEmbyProxyNode(req, room);
+  const nodeUrl = safeStorageNode(req, node).url;
+  const item = await embyFetchJson(conn, `/Users/${encodeURIComponent(conn.embyUserId)}/Items/${encodeURIComponent(itemId)}`, {
+    query: { Fields: 'Overview,ProductionYear,RunTimeTicks,IndexNumber,ParentIndexNumber,SeriesName,SeasonName,SeriesId,SeriesPrimaryImageTag' }
+  });
+  if (item.IsFolder) return res.status(400).json({ error: '只能播放具体的影片或剧集。' });
+  const playback = await embyFetchJson(conn, `/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, {
+    method: 'POST',
+    query: { UserId: conn.embyUserId },
+    body: {
+      DeviceProfile: EMBY_DEVICE_PROFILE,
+      EnableDirectPlay: true,
+      EnableDirectStream: true,
+      EnableTranscoding: true,
+      AllowVideoStreamCopy: true,
+      AllowAudioStreamCopy: true,
+      MaxStreamingBitrate: EMBY_MAX_BITRATE
+    }
+  });
+  const source = (playback.MediaSources || []).find((ms) => !ms.IsInfiniteStream) || (playback.MediaSources || [])[0];
+  if (!source) return res.status(400).json({ error: '该影片没有可播放的媒体源。' });
+  const containers = String(source.Container || '').toLowerCase().split(',');
+  const directContainers = ['mp4', 'm4v', 'mov', 'webm'];
+  const canDirect = directContainers.some((c) => containers.includes(c));
+  let mode;
+  if (source.SupportsDirectPlay && canDirect) mode = 'direct';
+  else if (source.SupportsTranscoding) mode = 'hls';
+  else if (source.SupportsDirectStream && canDirect) mode = 'direct';
+  else return res.status(400).json({ error: '该影片无法在浏览器直接播放。' });
+  const token = decryptSecret(conn.accessTokenCipher);
+  const grant = mintEmbyGrant({
+    baseUrl: conn.baseUrl,
+    token,
+    deviceId: conn.deviceId,
+    embyUserId: conn.embyUserId,
+    itemId,
+    mediaSourceId: source.Id || '',
+    roomId: room.id,
+    priv: embyConnectionIsPrivate(conn) ? 1 : 0
+  });
+  const base = `${nodeUrl}/emby/${grant}`;
+  const mediaUrl = mode === 'hls' ? `${base}/hls/master.m3u8` : `${base}/stream`;
+  const subtitles = (source.MediaStreams || [])
+    .filter((stream) => stream.Type === 'Subtitle' && (stream.IsTextSubtitleStream || stream.SupportsExternalStream))
+    .slice(0, 20)
+    .map((stream) => ({
+      index: Number(stream.Index),
+      label: String(stream.DisplayTitle || stream.Language || `字幕 ${stream.Index}`).slice(0, 80),
+      language: String(stream.Language || '').slice(0, 16),
+      isDefault: Boolean(stream.IsDefault)
+    }));
+  const normalized = normalizeEmbyItem(item, conn);
+  const album = item.Type === 'Episode'
+    ? [item.SeasonName || (Number.isFinite(Number(item.ParentIndexNumber)) ? `第 ${item.ParentIndexNumber} 季` : ''), normalized.year].filter(Boolean).join(' · ')
+    : (normalized.year ? String(normalized.year) : '');
+  const track = {
+    id: `emby_${conn.serverId || 'srv'}_${itemId}`.replace(/[^A-Za-z0-9_]/g, '').slice(0, 80),
+    mediaUrl,
+    mediaType: 'video',
+    title: embyTrackTitle(item),
+    artist: item.SeriesName || '',
+    album,
+    coverUrl: normalized.posterUrl,
+    duration: normalized.runtime || null,
+    sourceName: `Emby · ${conn.name}`,
+    source: {
+      kind: 'emby',
+      serverId: conn.serverId || '',
+      connectionId: conn.id,
+      itemId,
+      mediaSourceId: source.Id || '',
+      nodeId: node.id,
+      mode,
+      itemType: item.Type || 'Video',
+      seriesName: item.SeriesName || '',
+      seasonName: item.SeasonName || '',
+      indexNumber: normalized.indexNumber,
+      parentIndexNumber: normalized.parentIndexNumber,
+      year: normalized.year,
+      subtitles
+    }
+  };
+  res.json({ track });
 }));
 
 app.post('/api/media/metadata', requireAuth, asyncRoute(async (req, res) => {

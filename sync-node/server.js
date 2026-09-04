@@ -7,6 +7,7 @@ const fs = require('fs');
 const http = require('http');
 const https = require('https');
 const multer = require('multer');
+const net = require('net');
 const path = require('path');
 const { Readable } = require('stream');
 const { pipeline } = require('stream/promises');
@@ -48,6 +49,47 @@ const ENDED_DEDUPE_WINDOW_MS = 2500;
 const CHAT_BURST = 5;
 const CHAT_REFILL_PER_SECOND = 1;
 const TEXT_LIMITS = { title: 160, artist: 120, album: 120, sourceName: 180, coverUrl: 3000 };
+
+// ---- Emby proxy config -----------------------------------------------------------------------
+// The main site mints an encrypted grant with a key derived from the shared NODE_TOKEN; this node
+// opens it to proxy an Emby stream so browsers never see the Emby token or address.
+const EMBY_GRANT_KEY = crypto.createHash('sha256').update(NODE_TOKEN).digest();
+const EMBY_CLIENT_NAME = 'PlayTogether';
+const EMBY_CLIENT_VERSION = '1.0.0';
+const EMBY_MAX_BITRATE = 40000000;
+const EMBY_AUTH_QUERY_KEYS = new Set(['api_key', 'apikey', 'x-emby-token', 'x-mediabrowser-token', 'x-emby-authorization', 'authorization']);
+const EMBY_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
+const EMBY_SEGMENT_TTL_MS = 120 * 1000;
+const EMBY_SEGMENT_CACHE_MAX = 96 * 1024 * 1024;
+const EMBY_PLAYLIST_TTL_MS = 1000;
+const EMBY_DEVICE_PROFILE = {
+  MaxStreamingBitrate: EMBY_MAX_BITRATE,
+  MaxStaticBitrate: EMBY_MAX_BITRATE,
+  DirectPlayProfiles: [
+    { Container: 'mp4,m4v,mov', Type: 'Video', VideoCodec: 'h264,av1', AudioCodec: 'aac,mp3,opus,flac,ac3' },
+    { Container: 'webm', Type: 'Video', VideoCodec: 'vp8,vp9,av1', AudioCodec: 'opus,vorbis' }
+  ],
+  TranscodingProfiles: [
+    {
+      Container: 'ts', Type: 'Video', Protocol: 'hls', VideoCodec: 'h264', AudioCodec: 'aac,mp3',
+      Context: 'Streaming', MaxAudioChannels: '2', MinSegments: '1', BreakOnNonKeyFrames: true
+    }
+  ],
+  SubtitleProfiles: [
+    { Format: 'vtt', Method: 'External' },
+    { Format: 'srt', Method: 'External' },
+    { Format: 'subrip', Method: 'External' },
+    { Format: 'ass', Method: 'External' },
+    { Format: 'ssa', Method: 'External' },
+    { Format: 'pgssub', Method: 'Encode' },
+    { Format: 'dvdsub', Method: 'Encode' }
+  ]
+};
+const embyHlsSessions = new Map();
+const embySegmentCache = new Map();
+const embyPlaylistCache = new Map();
+const embyInflight = new Map();
+let embySegmentBytes = 0;
 
 fs.mkdirSync(STORAGE_ROOT, { recursive: true });
 fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
@@ -465,7 +507,7 @@ async function listDir(rel) {
 app.use(express.json({ limit: '2mb' }));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Headers', 'content-type,x-node-token');
+  res.setHeader('Access-Control-Allow-Headers', 'content-type,x-node-token,range,if-range');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
@@ -478,7 +520,8 @@ app.get('/health', (req, res) => {
     roles: Array.from(ROLES),
     port: PORT,
     protocol: tlsEnabled ? 'https' : 'http',
-    storageRoot: ROLES.has('storage') ? STORAGE_ROOT : null
+    storageRoot: ROLES.has('storage') ? STORAGE_ROOT : null,
+    features: ['emby-proxy']
   });
 });
 
@@ -491,6 +534,399 @@ app.use('/videos', requireRole('storage'), express.static(STORAGE_ROOT, {
     res.setHeader('Accept-Ranges', 'bytes');
   }
 }));
+
+// ---- Emby proxy ------------------------------------------------------------------------------
+
+function isPrivateIpAddress(address) {
+  const version = net.isIP(address);
+  if (!version) return false;
+  if (version === 6) {
+    const value = address.toLowerCase();
+    return value === '::1' || value.startsWith('fc') || value.startsWith('fd') || value.startsWith('fe80:') || value === '::';
+  }
+  const parts = address.split('.').map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part))) return true;
+  const [a, b] = parts;
+  return a === 10 || a === 127 || a === 0 || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+}
+
+function isPrivateHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  if (!host || host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (net.isIP(host)) return isPrivateIpAddress(host);
+  return false;
+}
+
+function openEmbyGrant(token) {
+  const [version, ivPart, tagPart, dataPart] = String(token || '').split('.');
+  if (version !== 'v1' || !ivPart || !tagPart || !dataPart) {
+    const err = new Error('播放凭证无效。');
+    err.status = 401;
+    err.code = 'grant_expired';
+    throw err;
+  }
+  let payload;
+  try {
+    const decipher = crypto.createDecipheriv('aes-256-gcm', EMBY_GRANT_KEY, Buffer.from(ivPart, 'base64url'));
+    decipher.setAuthTag(Buffer.from(tagPart, 'base64url'));
+    const plain = Buffer.concat([decipher.update(Buffer.from(dataPart, 'base64url')), decipher.final()]).toString('utf8');
+    payload = JSON.parse(plain);
+  } catch {
+    const err = new Error('播放凭证无效。');
+    err.status = 401;
+    err.code = 'grant_expired';
+    throw err;
+  }
+  const [baseUrl, tok, deviceId, embyUserId, itemId, mediaSourceId, roomId, priv, exp] = payload;
+  if (!exp || Number(exp) < Date.now()) {
+    const err = new Error('播放凭证已过期。');
+    err.status = 401;
+    err.code = 'grant_expired';
+    throw err;
+  }
+  return { baseUrl, token: tok, deviceId, embyUserId, itemId, mediaSourceId, roomId, priv: Number(priv) || 0, exp: Number(exp) };
+}
+
+function embyGrantHeaders(grant) {
+  const parts = [
+    `Client="${encodeURIComponent(EMBY_CLIENT_NAME)}"`,
+    `Device="${encodeURIComponent(EMBY_CLIENT_NAME)}"`,
+    `DeviceId="${encodeURIComponent(grant.deviceId || 'playtogether')}"`,
+    `Version="${encodeURIComponent(EMBY_CLIENT_VERSION)}"`,
+    `Token="${encodeURIComponent(grant.token || '')}"`
+  ];
+  const value = `MediaBrowser ${parts.join(', ')}`;
+  return {
+    Authorization: value,
+    'X-Emby-Authorization': value,
+    'X-Emby-Token': grant.token || '',
+    Accept: '*/*'
+  };
+}
+
+function embyBasePrefix(grant) {
+  const base = new URL(grant.baseUrl);
+  return `${base.pathname.replace(/\/+$/, '')}/Videos/${grant.itemId}/`;
+}
+
+function stripEmbyAuthQuery(searchParams) {
+  for (const key of [...searchParams.keys()]) {
+    if (EMBY_AUTH_QUERY_KEYS.has(key.toLowerCase())) searchParams.delete(key);
+  }
+}
+
+// Build an upstream Emby URL for a path that must resolve under /Videos/{itemId}/ (the only tree a
+// grant may reach). `relPath` is the untrusted segment; anything that normalises outside is refused.
+function embyUpstreamUrl(grant, relPath, rawQuery) {
+  const base = new URL(grant.baseUrl);
+  const prefix = embyBasePrefix(grant);
+  const joined = path.posix.normalize(`${prefix}${String(relPath || '').replace(/^\/+/, '')}`);
+  if (!joined.toLowerCase().startsWith(prefix.toLowerCase())) {
+    const err = new Error('路径越界。');
+    err.status = 403;
+    throw err;
+  }
+  const url = new URL(base.origin);
+  url.pathname = joined;
+  if (rawQuery) {
+    const incoming = new URLSearchParams(rawQuery);
+    stripEmbyAuthQuery(incoming);
+    url.search = incoming.toString();
+  }
+  return url;
+}
+
+function rewriteEmbyUri(uri, upstreamUrl, grant) {
+  let abs;
+  try {
+    abs = new URL(uri, upstreamUrl);
+  } catch {
+    return uri;
+  }
+  const prefix = embyBasePrefix(grant).toLowerCase();
+  if (!abs.pathname.toLowerCase().startsWith(prefix)) return uri;
+  const rel = abs.pathname.slice(embyBasePrefix(grant).length);
+  const params = abs.searchParams;
+  stripEmbyAuthQuery(params);
+  const query = params.toString();
+  return query ? `${rel}?${query}` : rel;
+}
+
+// Rewrites playlist URIs to relative paths under this grant so hls.js resolves them back through the
+// node (never straight to Emby), and drops the api_key Emby stamps on every line.
+function rewriteEmbyPlaylist(text, upstreamUrl, grant) {
+  return String(text).split(/\r?\n/).map((line) => {
+    if (!line) return line;
+    if (line.startsWith('#')) {
+      return line.replace(/URI="([^"]*)"/g, (match, uri) => `URI="${rewriteEmbyUri(uri, upstreamUrl, grant)}"`);
+    }
+    return rewriteEmbyUri(line, upstreamUrl, grant);
+  }).join('\n');
+}
+
+function setEmbyCorsHeaders(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Accept-Ranges,Content-Type');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Accept-Ranges', 'bytes');
+}
+
+// Byte streams (direct play, HLS segments served with Range) go through core http so there is no
+// undici auto-decompression and no request-body timeout on a long-held connection.
+function proxyEmbyStream(req, res, url, grant) {
+  const lib = url.protocol === 'https:' ? https : http;
+  const headers = { ...embyGrantHeaders(grant), 'Accept-Encoding': 'identity' };
+  if (req.headers.range) headers.Range = req.headers.range;
+  if (req.headers['if-range']) headers['If-Range'] = req.headers['if-range'];
+  const upstream = lib.request(url, { method: 'GET', headers }, (up) => {
+    clearTimeout(headerTimer);
+    setEmbyCorsHeaders(res);
+    res.statusCode = up.statusCode || 502;
+    for (const name of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified', 'cache-control']) {
+      if (up.headers[name]) res.setHeader(name, up.headers[name]);
+    }
+    if (!up.headers['accept-ranges']) res.setHeader('Accept-Ranges', 'bytes');
+    up.pipe(res);
+    up.on('error', () => res.destroy());
+  });
+  const headerTimer = setTimeout(() => upstream.destroy(new Error('timeout')), 15000);
+  upstream.on('error', () => {
+    clearTimeout(headerTimer);
+    if (!res.headersSent) res.status(502).json({ error: '无法连接 Emby 服务器。' });
+    else res.destroy();
+  });
+  res.on('close', () => {
+    clearTimeout(headerTimer);
+    upstream.destroy();
+  });
+  upstream.end();
+}
+
+async function embyUpstreamFetch(grant, url, { method = 'GET', body, timeout = 15000 } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: {
+        ...embyGrantHeaders(grant),
+        'Accept-Encoding': 'identity',
+        ...(body ? { 'Content-Type': 'application/json' } : {})
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      redirect: 'manual',
+      signal: controller.signal
+    });
+    return response;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function embyFetchText(grant, url) {
+  const response = await embyUpstreamFetch(grant, url);
+  if (response.status === 401 || response.status === 403) {
+    const err = new Error('Emby 授权已失效。');
+    err.status = 401;
+    err.code = 'emby_unauthorized';
+    throw err;
+  }
+  if (!response.ok) {
+    const err = new Error(`Emby 返回 HTTP ${response.status}。`);
+    err.status = 502;
+    throw err;
+  }
+  return response.text();
+}
+
+async function embyFetchJson(grant, pathname, query, body) {
+  const base = new URL(grant.baseUrl);
+  const url = new URL(`${base.pathname.replace(/\/+$/, '')}/${pathname.replace(/^\/+/, '')}`, base.origin);
+  for (const [key, value] of Object.entries(query || {})) {
+    if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, value);
+  }
+  const response = await embyUpstreamFetch(grant, url, { method: body ? 'POST' : 'GET', body });
+  if (response.status === 401 || response.status === 403) {
+    const err = new Error('Emby 授权已失效。');
+    err.status = 401;
+    err.code = 'emby_unauthorized';
+    throw err;
+  }
+  const text = await response.text();
+  if (!response.ok) {
+    const err = new Error(`Emby 返回 HTTP ${response.status}。`);
+    err.status = 502;
+    throw err;
+  }
+  return text ? JSON.parse(text) : {};
+}
+
+// One PlaybackInfo (and therefore one transcode session / PlaySessionId) is shared by the whole
+// room, so Emby only ever counts a single concurrent stream per title.
+async function embyHlsSession(grant) {
+  const key = `${grant.baseUrl}|${grant.itemId}|${grant.mediaSourceId}`;
+  const cached = embyHlsSessions.get(key);
+  if (cached && Date.now() - cached.at < EMBY_SESSION_TTL_MS) return cached;
+  const info = await embyFetchJson(
+    grant,
+    `Items/${encodeURIComponent(grant.itemId)}/PlaybackInfo`,
+    { UserId: grant.embyUserId },
+    {
+      DeviceProfile: EMBY_DEVICE_PROFILE,
+      EnableDirectPlay: false,
+      EnableDirectStream: false,
+      EnableTranscoding: true,
+      MediaSourceId: grant.mediaSourceId,
+      MaxStreamingBitrate: EMBY_MAX_BITRATE
+    }
+  );
+  const source = (info.MediaSources || []).find((ms) => ms.Id === grant.mediaSourceId) || (info.MediaSources || [])[0];
+  if (!source || !source.TranscodingUrl) {
+    const err = new Error('Emby 未返回转码地址。');
+    err.status = 502;
+    throw err;
+  }
+  const session = { at: Date.now(), transcodingUrl: source.TranscodingUrl, playSessionId: info.PlaySessionId || '' };
+  embyHlsSessions.set(key, session);
+  return session;
+}
+
+function pruneEmbySegments() {
+  const nowMs = Date.now();
+  for (const [key, entry] of embySegmentCache) {
+    if (nowMs - entry.at > EMBY_SEGMENT_TTL_MS) {
+      embySegmentCache.delete(key);
+      embySegmentBytes -= entry.buf.length;
+    }
+  }
+  while (embySegmentBytes > EMBY_SEGMENT_CACHE_MAX && embySegmentCache.size) {
+    const [key, entry] = embySegmentCache.entries().next().value;
+    embySegmentCache.delete(key);
+    embySegmentBytes -= entry.buf.length;
+  }
+}
+
+// Concurrent requests for the same segment hit Emby once; a small LRU lets late-arriving members
+// reuse it, keeping the shared transcode from being fetched N times.
+async function embyFetchSegment(grant, url) {
+  const key = url.toString();
+  const cached = embySegmentCache.get(key);
+  if (cached) {
+    cached.at = Date.now();
+    return cached;
+  }
+  if (embyInflight.has(key)) return embyInflight.get(key);
+  const promise = (async () => {
+    const response = await embyUpstreamFetch(grant, url, { timeout: 20000 });
+    if (!response.ok) {
+      const err = new Error(`Emby 返回 HTTP ${response.status}。`);
+      err.status = response.status >= 400 && response.status < 500 ? response.status : 502;
+      throw err;
+    }
+    const buf = Buffer.from(await response.arrayBuffer());
+    const type = response.headers.get('content-type') || 'application/octet-stream';
+    const entry = { at: Date.now(), buf, type };
+    embySegmentCache.set(key, entry);
+    embySegmentBytes += buf.length;
+    pruneEmbySegments();
+    return entry;
+  })();
+  embyInflight.set(key, promise);
+  try {
+    return await promise;
+  } finally {
+    embyInflight.delete(key);
+  }
+}
+
+async function embyServePlaylist(grant, upstreamUrl, res) {
+  const key = upstreamUrl.toString();
+  const cached = embyPlaylistCache.get(key);
+  let text;
+  if (cached && Date.now() - cached.at < EMBY_PLAYLIST_TTL_MS) {
+    text = cached.text;
+  } else {
+    text = rewriteEmbyPlaylist(await embyFetchText(grant, upstreamUrl), upstreamUrl, grant);
+    embyPlaylistCache.set(key, { at: Date.now(), text });
+    if (embyPlaylistCache.size > 200) embyPlaylistCache.delete(embyPlaylistCache.keys().next().value);
+  }
+  setEmbyCorsHeaders(res);
+  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+  res.setHeader('Cache-Control', 'private, max-age=1');
+  res.send(text);
+}
+
+function embyGrantMiddleware(req, res, next) {
+  try {
+    req.embyGrant = openEmbyGrant(req.params.grant);
+  } catch (error) {
+    return res.status(error.status || 401).json({ error: error.message, code: error.code || 'grant_expired' });
+  }
+  try {
+    if (req.embyGrant.priv === 0 && isPrivateHost(new URL(req.embyGrant.baseUrl).hostname)) {
+      return res.status(403).json({ error: '目标地址不被允许。' });
+    }
+  } catch {
+    return res.status(400).json({ error: 'Emby 地址不合法。' });
+  }
+  next();
+}
+
+app.get('/emby/:grant/stream', requireRole('storage'), embyGrantMiddleware, (req, res) => {
+  const grant = req.embyGrant;
+  const query = `Static=true&MediaSourceId=${encodeURIComponent(grant.mediaSourceId)}&DeviceId=${encodeURIComponent(grant.deviceId || '')}`;
+  proxyEmbyStream(req, res, embyUpstreamUrl(grant, 'stream', query), grant);
+});
+
+app.get('/emby/:grant/hls/{*splat}', requireRole('storage'), embyGrantMiddleware, async (req, res) => {
+  const grant = req.embyGrant;
+  const rel = (Array.isArray(req.params.splat) ? req.params.splat.join('/') : String(req.params.splat || ''));
+  const rawQuery = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?') + 1) : '';
+  if (/(^|\/)master\.m3u8$/i.test(rel)) {
+    const session = await embyHlsSession(grant);
+    const upstreamUrl = new URL(session.transcodingUrl, new URL(grant.baseUrl).origin);
+    return embyServePlaylist(grant, upstreamUrl, res);
+  }
+  const upstreamUrl = embyUpstreamUrl(grant, rel, rawQuery);
+  if (/\.m3u8$/i.test(rel)) {
+    return embyServePlaylist(grant, upstreamUrl, res);
+  }
+  try {
+    const segment = await embyFetchSegment(grant, upstreamUrl);
+    setEmbyCorsHeaders(res);
+    res.setHeader('Content-Type', segment.type);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.send(segment.buf);
+  } catch (error) {
+    // A dead PlaySessionId means the cached session is stale; drop it so the next master reloads.
+    if (error.status >= 400 && error.status < 500) {
+      embyHlsSessions.delete(`${grant.baseUrl}|${grant.itemId}|${grant.mediaSourceId}`);
+    }
+    throw error;
+  }
+});
+
+app.get('/emby/:grant/sub/:index', requireRole('storage'), embyGrantMiddleware, async (req, res) => {
+  const grant = req.embyGrant;
+  const index = String(req.params.index).replace(/[^0-9]/g, '') || '0';
+  const upstreamUrl = embyUpstreamUrl(grant, `${encodeURIComponent(grant.mediaSourceId)}/Subtitles/${index}/Stream.vtt`, '');
+  const text = await embyFetchText(grant, upstreamUrl);
+  setEmbyCorsHeaders(res);
+  res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.send(text);
+});
+
+app.get('/emby/:grant/probe', requireRole('storage'), embyGrantMiddleware, async (req, res) => {
+  const grant = req.embyGrant;
+  try {
+    await embyFetchJson(grant, `Users/${encodeURIComponent(grant.embyUserId)}/Items/${encodeURIComponent(grant.itemId)}`, {});
+    res.json({ ok: true, mode: grant.mediaSourceId ? 'ready' : 'ready' });
+  } catch (error) {
+    res.status(error.status || 502).json({ error: error.message, code: error.code || 'emby_error' });
+  }
+});
 
 app.get('/storage/list', requireRole('storage'), requireNodeToken, async (req, res) => {
   res.json(await listDir(req.query.path || ''));
@@ -702,11 +1138,46 @@ function legacyMusicQueue(room) {
   return queueFor(room, 'audio');
 }
 
+function safeInt(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? Math.trunc(num) : null;
+}
+
+// External-source metadata (currently Emby) rides along on the track so every member's client can
+// fetch subtitles and show queued state without its own account. Only a fixed shape survives.
+function sanitizeTrackSource(input) {
+  if (!input || typeof input !== 'object' || input.kind !== 'emby') return undefined;
+  const subtitles = Array.isArray(input.subtitles)
+    ? input.subtitles.slice(0, 20).map((sub) => ({
+      index: safeInt(sub.index) ?? 0,
+      label: safeShortText(sub.label, 80),
+      language: safeShortText(sub.language, 16),
+      isDefault: Boolean(sub.isDefault)
+    }))
+    : [];
+  return {
+    kind: 'emby',
+    serverId: safeShortText(input.serverId, 80),
+    connectionId: safeShortText(input.connectionId, 80),
+    itemId: safeShortText(input.itemId, 80),
+    mediaSourceId: safeShortText(input.mediaSourceId, 80),
+    nodeId: safeShortText(input.nodeId, 80),
+    mode: input.mode === 'direct' ? 'direct' : 'hls',
+    itemType: safeShortText(input.itemType, 40),
+    seriesName: safeShortText(input.seriesName, 120),
+    seasonName: safeShortText(input.seasonName, 120),
+    indexNumber: safeInt(input.indexNumber),
+    parentIndexNumber: safeInt(input.parentIndexNumber),
+    year: safeInt(input.year),
+    subtitles
+  };
+}
+
 function sanitizeTrack(input = {}, fallbackType = 'audio') {
   const mediaUrl = safeShortText(input.mediaUrl || input.url || input.videoUrl, 3000);
   if (!mediaUrl) return null;
   const mediaType = safeMediaType(input.mediaType || fallbackType);
-  return {
+  const track = {
     id: safeShortText(input.id, 80) || randomId('track'),
     mediaUrl,
     mediaType,
@@ -719,6 +1190,9 @@ function sanitizeTrack(input = {}, fallbackType = 'audio') {
     sourceName: safeShortText(input.sourceName || input.name, TEXT_LIMITS.sourceName),
     addedAt: now()
   };
+  const source = sanitizeTrackSource(input.source);
+  if (source) track.source = source;
+  return track;
 }
 
 function currentTrack(room, mediaType = room.state.mediaType || room.state.roomMode) {
@@ -816,6 +1290,18 @@ function handleQueueMessage(room, user, message) {
     }
     if ('duration' in message.patch) track.duration = Number.isFinite(Number(message.patch.duration)) ? Math.max(0, Number(message.patch.duration)) : null;
     if ('lyrics' in message.patch) track.lyrics = safeLyrics(message.patch.lyrics);
+    // A refreshed Emby grant re-points the same track; if it is the current one, update the live
+    // media URL in place without rewinding (position and version are handled by touchRoomState).
+    if ('mediaUrl' in message.patch) {
+      const nextUrl = safeShortText(message.patch.mediaUrl, 3000);
+      if (/^https?:\/\//i.test(nextUrl)) {
+        track.mediaUrl = nextUrl;
+        if (room.state.currentTrackId === track.id) {
+          room.state.mediaUrl = nextUrl;
+          room.state.videoUrl = nextUrl;
+        }
+      }
+    }
     if (room.state.currentTrackId === track.id) {
       room.state.mediaMeta = {
         title: track.title,
