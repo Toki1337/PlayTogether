@@ -155,20 +155,40 @@ function setButtonBusy(button, busy, label) {
   }
 }
 
-// Stable per-name hue for avatars and room covers.
+// Anthropic accent palette; a name always maps to the same swatch.
+const PALETTE = ['#d97757', '#d4a27f', '#629a90', '#6a9bcc', '#788c5d', '#c15f3c', '#b49fd8'];
+
 function hueFor(value) {
   let hash = 0;
-  for (const char of String(value || '')) hash = (hash * 31 + char.codePointAt(0)) % 360;
+  for (const char of String(value || '')) hash = (hash * 31 + char.codePointAt(0)) % 100003;
   return hash;
+}
+
+function swatchFor(value, offset = 0) {
+  return PALETTE[(hueFor(value) + offset) % PALETTE.length];
 }
 
 function avatarEl(name, size = '') {
   const el = document.createElement('span');
   el.className = `avatar${size ? ` avatar-${size}` : ''}`;
-  el.style.setProperty('--hue', String(hueFor(name)));
+  el.style.setProperty('--avatar-bg', swatchFor(name));
   el.textContent = String(name || '?').trim().slice(0, 1);
   el.setAttribute('aria-hidden', 'true');
   return el;
+}
+
+function greetingForNow() {
+  const hour = new Date().getHours();
+  if (hour < 5) return '夜深了，一起看点什么？';
+  if (hour < 11) return '早上好，一起看点什么？';
+  if (hour < 14) return '中午好，一起看点什么？';
+  if (hour < 18) return '下午好，一起看点什么？';
+  return '今晚一起看点什么？';
+}
+
+function renderLobbyGreeting() {
+  const el = $('#lobbyGreeting');
+  if (el) el.textContent = greetingForNow();
 }
 
 function iconEl(name) {
@@ -528,6 +548,7 @@ function updateNodeConfigSslFields() {
 function updateMetrics() {
   const count = $('#roomCount');
   if (count) count.textContent = String(state.rooms.length);
+  renderLobbyGreeting();
 }
 
 function roomIdFromHash() {
@@ -656,7 +677,8 @@ function renderRooms() {
     const isCurrent = state.currentRoom?.id === room.id;
     const card = document.createElement('article');
     card.className = ['room-card', isCurrent ? 'is-current' : '', room.syncNodeEnabled ? '' : 'is-disabled'].filter(Boolean).join(' ');
-    card.style.setProperty('--hue', String(hueFor(room.id)));
+    card.style.setProperty('--tile-a', swatchFor(room.id));
+    card.style.setProperty('--tile-b', swatchFor(room.id, 3));
     const cover = document.createElement('div');
     cover.className = 'room-cover';
     const glyph = document.createElement('span');
@@ -894,7 +916,7 @@ function initVideoPlayer() {
       autoSize: false,
       playsInline: true,
       lang: 'zh-cn',
-      theme: '#ff6b4a',
+      theme: '#d97757',
       volume: 0.8,
       setting: true,
       hotkey: true,

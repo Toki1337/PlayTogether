@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0a0a0e">
-  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#faf9f5">
+  <meta name="color-scheme" content="light">
   <title>PlayTogether</title>
   <link rel="icon" type="image/webp" href="/material/xiuzhen.webp?v=20260513-icon1">
-  <link rel="stylesheet" href="/styles.css?v=20260904-dark1">
+  <link rel="stylesheet" href="/styles.css?v=20260904-claude1">
   <script src="/vendor/artplayer.js"></script>
   <script src="/vendor/hls.js"></script>
-  <script defer src="/app.js?v=20260904-dark1"></script>
+  <script defer src="/app.js?v=20260904-claude1"></script>
 </head>
 <body>
   <nav class="global-nav">
@@ -25,7 +25,7 @@
 
   <section id="authView" class="auth-screen">
     <div class="auth-hero">
-      <span class="auth-orbit" aria-hidden="true"></span>
+      <div class="auth-mark" aria-hidden="true"></div>
       <h1>一起看。</h1>
       <p>同步播放、聊天、弹幕，和朋友在同一秒。</p>
     </div>
@@ -66,11 +66,14 @@
     <main>
       <section id="lobbyView" class="surface">
         <div class="lobby">
-          <form id="createRoomForm" class="create-strip">
-            <input id="roomName" maxlength="60" placeholder="给房间起个名字，比如「周五电影夜」" aria-label="房间名">
-            <select id="roomSyncNode" aria-label="sync node"></select>
-            <button class="primary-pill" type="submit">创建房间</button>
-          </form>
+          <div class="lobby-hero">
+            <h1 id="lobbyGreeting" class="lobby-greeting">今晚一起看点什么？</h1>
+            <form id="createRoomForm" class="create-strip">
+              <input id="roomName" maxlength="60" placeholder="给房间起个名字，比如「周五电影夜」" aria-label="房间名">
+              <select id="roomSyncNode" aria-label="sync node"></select>
+              <button class="primary-pill" type="submit">创建房间</button>
+            </form>
+          </div>
           <div>
             <div class="section-head">
               <h3>房间 <span id="roomCount" class="count-badge">0</span></h3>
