@@ -143,15 +143,39 @@ function setText(selector, value) {
 function setButtonBusy(button, busy, label) {
   if (!button) return;
   if (busy) {
-    button.dataset.originalText = button.textContent;
+    button.dataset.originalHtml = button.innerHTML;
     button.textContent = label || '处理中';
     button.disabled = true;
     button.setAttribute('aria-busy', 'true');
   } else {
-    button.textContent = button.dataset.originalText || button.textContent;
+    if (button.dataset.originalHtml !== undefined) button.innerHTML = button.dataset.originalHtml;
+    delete button.dataset.originalHtml;
     button.disabled = false;
     button.removeAttribute('aria-busy');
   }
+}
+
+// Stable per-name hue for avatars and room covers.
+function hueFor(value) {
+  let hash = 0;
+  for (const char of String(value || '')) hash = (hash * 31 + char.codePointAt(0)) % 360;
+  return hash;
+}
+
+function avatarEl(name, size = '') {
+  const el = document.createElement('span');
+  el.className = `avatar${size ? ` avatar-${size}` : ''}`;
+  el.style.setProperty('--hue', String(hueFor(name)));
+  el.textContent = String(name || '?').trim().slice(0, 1);
+  el.setAttribute('aria-hidden', 'true');
+  return el;
+}
+
+function iconEl(name) {
+  const el = document.createElement('i');
+  el.className = `icon icon-${name}`;
+  el.setAttribute('aria-hidden', 'true');
+  return el;
 }
 
 async function withBusy(button, work, label) {
@@ -542,7 +566,13 @@ function showAuthenticated(user) {
   $('#authView').classList.add('hidden');
   $('#appView').classList.remove('hidden');
   $('#logoutBtn').classList.remove('hidden');
-  $('#currentUser').textContent = user ? `${user.username} · ${user.role === 'admin' ? '管理员' : '用户'}` : '';
+  const nav = $('#currentUser');
+  nav.innerHTML = '';
+  if (user) {
+    const name = document.createElement('span');
+    name.textContent = user.displayName || user.username;
+    nav.append(avatarEl(user.displayName || user.username), name);
+  }
   $('#adminTab').classList.toggle('hidden', user?.role !== 'admin');
 }
 
@@ -621,24 +651,41 @@ function renderRooms() {
     renderEmpty(list, '还没有房间');
     return;
   }
+  const fragment = document.createDocumentFragment();
   for (const room of state.rooms) {
     const isCurrent = state.currentRoom?.id === room.id;
-    const item = document.createElement('div');
-    item.className = `list-item room-item${isCurrent ? ' is-current' : ''}`;
-    const main = document.createElement('div');
-    const title = document.createElement('p');
-    title.className = 'item-title';
-    title.textContent = room.name;
-    const meta = document.createElement('p');
-    meta.className = 'item-meta';
-    meta.textContent = `${room.ownerName} · ${room.syncNodeName} · ${formatTime(room.createdAt)}`;
-    main.append(title, meta);
-    if (!room.syncNodeEnabled) {
-      const badge = document.createElement('span');
-      badge.className = statusClass('bad');
-      badge.textContent = '节点停用';
-      main.appendChild(badge);
+    const card = document.createElement('article');
+    card.className = ['room-card', isCurrent ? 'is-current' : '', room.syncNodeEnabled ? '' : 'is-disabled'].filter(Boolean).join(' ');
+    card.style.setProperty('--hue', String(hueFor(room.id)));
+    const cover = document.createElement('div');
+    cover.className = 'room-cover';
+    const glyph = document.createElement('span');
+    glyph.className = 'room-cover-glyph';
+    glyph.textContent = String(room.name || '房').trim().slice(0, 1);
+    cover.appendChild(glyph);
+    if (isCurrent || !room.syncNodeEnabled) {
+      const tag = document.createElement('span');
+      tag.className = `${statusClass(isCurrent ? 'good' : 'bad')} room-cover-tag`;
+      tag.textContent = isCurrent ? '当前房间' : '节点停用';
+      cover.appendChild(tag);
     }
+    const body = document.createElement('div');
+    body.className = 'room-body';
+    const title = document.createElement('h4');
+    title.className = 'room-title';
+    title.textContent = room.name;
+    title.title = room.name;
+    const meta = document.createElement('p');
+    meta.className = 'room-meta';
+    const owner = document.createElement('span');
+    owner.textContent = `${room.ownerName} · ${room.syncNodeName}`;
+    meta.append(avatarEl(room.ownerName, 'xs'), owner);
+    body.append(title, meta);
+    const actions = document.createElement('div');
+    actions.className = 'room-actions';
+    const time = document.createElement('span');
+    time.className = 'room-time';
+    time.textContent = formatTime(room.createdAt);
     const join = document.createElement('button');
     join.className = isCurrent ? 'secondary-pill' : 'primary-pill';
     join.type = 'button';
@@ -648,9 +695,11 @@ function renderRooms() {
       if (isCurrent) return switchView('room');
       withBusy(join, () => joinRoom(room.id), '加入中');
     });
-    item.append(main, join);
-    list.appendChild(item);
+    actions.append(time, join);
+    card.append(cover, body, actions);
+    fragment.appendChild(card);
   }
+  list.appendChild(fragment);
 }
 
 async function joinRoom(roomId) {
@@ -845,7 +894,7 @@ function initVideoPlayer() {
       autoSize: false,
       playsInline: true,
       lang: 'zh-cn',
-      theme: '#0071e3',
+      theme: '#ff6b4a',
       volume: 0.8,
       setting: true,
       hotkey: true,
@@ -1539,12 +1588,14 @@ function renderMediaQueue() {
     handle.className = 'queue-drag-handle';
     handle.type = 'button';
     handle.setAttribute('aria-label', `拖动 ${trackTitle}`);
-    let cover = null;
-    if (isAudioQueue) {
-      cover = document.createElement('div');
-      cover.className = 'queue-track-cover';
-      cover.textContent = track.coverUrl ? '' : (trackTitle || '音').slice(0, 1).toUpperCase();
-      cover.style.backgroundImage = track.coverUrl ? coverImageValue(track.coverUrl) : '';
+    const cover = document.createElement('div');
+    cover.className = 'queue-track-cover';
+    if (isAudioQueue && track.coverUrl) {
+      cover.style.backgroundImage = coverImageValue(track.coverUrl);
+    } else if (isAudioQueue) {
+      cover.textContent = (trackTitle || '音').slice(0, 1).toUpperCase();
+    } else {
+      cover.appendChild(iconEl('film'));
     }
     const main = document.createElement('button');
     main.className = 'music-queue-main';
@@ -1568,17 +1619,30 @@ function renderMediaQueue() {
     const actions = document.createElement('div');
     actions.className = 'music-queue-actions';
     actions.append(
-      actionButton('上移', 'pearl-button', () => sendQueueMessage('queue_move', { mediaType, trackId: track.id, direction: 'up' })),
-      actionButton('下移', 'pearl-button', () => sendQueueMessage('queue_move', { mediaType, trackId: track.id, direction: 'down' })),
-      actionButton('移除', 'pearl-button', () => sendQueueMessage('queue_remove', { mediaType, trackId: track.id }))
+      queueActionButton('up', '上移', () => sendQueueMessage('queue_move', { mediaType, trackId: track.id, direction: 'up' })),
+      queueActionButton('down', '下移', () => sendQueueMessage('queue_move', { mediaType, trackId: track.id, direction: 'down' })),
+      queueActionButton('close', '移除', () => sendQueueMessage('queue_remove', { mediaType, trackId: track.id }), true)
     );
     bindQueueDrag(row, handle, mediaType);
-    row.append(handle);
-    if (cover) row.append(cover);
-    row.append(main, actions);
+    row.append(handle, cover, main, actions);
     list.appendChild(row);
   }
   updateStorageQueueButtons();
+}
+
+function queueActionButton(icon, label, handler, danger = false) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `queue-action${danger ? ' is-danger' : ''}`;
+  button.setAttribute('aria-label', label);
+  button.title = label;
+  button.appendChild(iconEl(icon));
+  button.addEventListener('click', (event) => {
+    event.stopPropagation();
+    triggerButtonFeedback(button, feedbackKindFromText(label));
+    handler(event);
+  });
+  return button;
 }
 
 function queueTrackIdsFromDom() {
@@ -2011,12 +2075,16 @@ function renderMembers(members) {
     return;
   }
   const me = selfName();
+  const fragment = document.createDocumentFragment();
   for (const member of members) {
     const chip = document.createElement('span');
     chip.className = `member-chip${member.username === me ? ' is-self' : ''}`;
-    chip.textContent = member.username;
-    list.appendChild(chip);
+    const name = document.createElement('span');
+    name.textContent = member.username;
+    chip.append(avatarEl(member.username, 'xs'), name);
+    fragment.appendChild(chip);
   }
+  list.appendChild(fragment);
 }
 
 function renderMessages(messages) {
@@ -2033,15 +2101,20 @@ function renderMessages(messages) {
 
 function buildChatMessage(message) {
   if (!message) return null;
+  const isSelf = message.username === selfName();
   const wrap = document.createElement('div');
-  wrap.className = `chat-message${message.username === selfName() ? ' is-self' : ''}`;
+  wrap.className = `chat-message${isSelf ? ' is-self' : ''}`;
+  const bubble = document.createElement('div');
+  bubble.className = 'chat-bubble';
   const name = document.createElement('div');
   name.className = 'chat-name';
   name.textContent = message.username;
   const text = document.createElement('div');
   text.className = 'chat-text';
   text.textContent = message.text;
-  wrap.append(name, text);
+  bubble.append(name, text);
+  if (!isSelf) wrap.appendChild(avatarEl(message.username, 'sm'));
+  wrap.appendChild(bubble);
   return wrap;
 }
 
@@ -2221,8 +2294,9 @@ function setFileQueueButtonState(button, queued, animate = false) {
   button.disabled = Boolean(queued);
   button.classList.toggle('is-queued', Boolean(queued));
   if (!queued) button.classList.remove('queued-confirm');
-  button.textContent = queued ? '✓' : '加入队列';
-  button.setAttribute('aria-label', queued ? '已添加到队列' : '加入队列');
+  button.textContent = '';
+  button.setAttribute('aria-label', queued ? '已在队列中' : '加入队列');
+  button.title = queued ? '已在队列中' : '加入队列';
   if (queued && animate && !wasQueued) {
     button.classList.remove('queued-confirm');
     void button.offsetWidth;
@@ -2247,7 +2321,7 @@ function fileEntryLabel(entry) {
 }
 
 function fileEntryMeta(entry) {
-  if (entry.type !== 'file') return entry.path || '';
+  if (entry.type !== 'file') return '文件夹';
   const tags = [formatBytes(entry.size)];
   if (entry.isAudio) tags.push('音频');
   if (entry.isVideo) tags.push('视频');
@@ -2331,10 +2405,9 @@ function createFileThumbnail(entry, mediaUrl, shouldHydrateAudio = false) {
     entry.isAudio ? 'audio' : '',
     entry.isVideo ? 'video' : ''
   ].filter(Boolean).join(' ');
-  const label = document.createElement('span');
-  label.className = 'file-thumb-label';
-  label.textContent = fileEntryLabel(entry);
-  thumb.appendChild(label);
+  const glyph = iconEl(entry.type === 'dir' ? 'folder' : entry.isAudio ? 'music' : entry.isVideo ? 'film' : 'file');
+  glyph.classList.add('file-thumb-glyph');
+  thumb.appendChild(glyph);
   const wantsVideo = entry.type === 'file' && entry.isVideo && Boolean(mediaUrl);
   const wantsAudio = shouldHydrateAudio && entry.isAudio;
   if (wantsVideo || wantsAudio) {
@@ -2401,7 +2474,7 @@ function renderFileGrid(selector, entries, handlers) {
         }
         queueButton.disabled = true;
         queueButton.classList.add('is-loading');
-        queueButton.textContent = '添加中';
+        queueButton.setAttribute('aria-label', '添加中');
         try {
           const added = await handlers.onQueue(entry);
           setFileQueueButtonState(queueButton, Boolean(added), Boolean(added));

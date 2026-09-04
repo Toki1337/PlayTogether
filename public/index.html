@@ -3,13 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#faf9f5">
+  <meta name="theme-color" content="#0a0a0e">
+  <meta name="color-scheme" content="dark">
   <title>PlayTogether</title>
   <link rel="icon" type="image/webp" href="/material/xiuzhen.webp?v=20260513-icon1">
-  <link rel="stylesheet" href="/styles.css?v=20260904-sync1">
+  <link rel="stylesheet" href="/styles.css?v=20260904-dark1">
   <script src="/vendor/artplayer.js"></script>
   <script src="/vendor/hls.js"></script>
-  <script defer src="/app.js?v=20260904-sync1"></script>
+  <script defer src="/app.js?v=20260904-dark1"></script>
 </head>
 <body>
   <nav class="global-nav">
@@ -23,9 +24,10 @@
   </nav>
 
   <section id="authView" class="auth-screen">
-    <div class="auth-copy">
+    <div class="auth-hero">
+      <span class="auth-orbit" aria-hidden="true"></span>
       <h1>一起看。</h1>
-      <p>同步播放 · 聊天 · 弹幕</p>
+      <p>同步播放、聊天、弹幕，和朋友在同一秒。</p>
     </div>
     <div class="auth-panel">
       <div class="segmented" role="tablist" aria-label="登录或注册">
@@ -63,25 +65,18 @@
 
     <main>
       <section id="lobbyView" class="surface">
-        <div class="content-grid">
-          <form id="createRoomForm" class="utility-card form-stack featured-card">
-            <h3>创建房间</h3>
-            <label>
-              <span>房间名</span>
-              <input id="roomName" maxlength="60" placeholder="今晚一起看">
-            </label>
-            <label>
-              <span>sync node</span>
-              <select id="roomSyncNode"></select>
-            </label>
-            <button class="primary-pill" type="submit">创建并进入</button>
+        <div class="lobby">
+          <form id="createRoomForm" class="create-strip">
+            <input id="roomName" maxlength="60" placeholder="给房间起个名字，比如「周五电影夜」" aria-label="房间名">
+            <select id="roomSyncNode" aria-label="sync node"></select>
+            <button class="primary-pill" type="submit">创建房间</button>
           </form>
-          <div class="utility-card room-list-card">
+          <div>
             <div class="section-head">
               <h3>房间 <span id="roomCount" class="count-badge">0</span></h3>
-              <button id="refreshRoomsBtn" class="secondary-pill" type="button">刷新</button>
+              <button id="refreshRoomsBtn" class="pearl-button icon-only" type="button" aria-label="刷新" title="刷新"><i class="icon icon-refresh" aria-hidden="true"></i></button>
             </div>
-            <div id="roomList" class="list-stack"></div>
+            <div id="roomList" class="room-grid"></div>
           </div>
         </div>
       </section>
@@ -106,7 +101,7 @@
               <div class="player-shell is-empty">
                 <div id="artPlayerMount" class="art-player-mount"></div>
                 <div id="danmakuLayer" class="danmaku-layer"></div>
-                <div class="stage-empty" aria-hidden="true"><span>从媒体库选择要一起看的内容</span></div>
+                <div class="stage-empty" aria-hidden="true"><span><i class="icon icon-film"></i>从媒体库选择要一起看的内容</span></div>
               </div>
               <div id="musicPanel" class="music-panel hidden" aria-live="polite">
                 <div class="music-now">
@@ -164,11 +159,11 @@
                 <h3>媒体库</h3>
                 <div class="section-actions">
                   <select id="storageNodeSelect" aria-label="存储节点"></select>
-                  <button id="refreshStorageBrowserBtn" class="pearl-button" type="button" aria-label="刷新" title="刷新">刷新</button>
+                  <button id="refreshStorageBrowserBtn" class="pearl-button icon-only" type="button" aria-label="刷新" title="刷新"><i class="icon icon-refresh" aria-hidden="true"></i></button>
                 </div>
               </div>
               <div class="path-row">
-                <button id="storageBackBtn" class="pearl-button" type="button">上级</button>
+                <button id="storageBackBtn" class="pearl-button icon-only" type="button" aria-label="上级目录" title="上级目录"><i class="icon icon-back" aria-hidden="true"></i></button>
                 <span id="storagePathLabel">/</span>
               </div>
               <p id="storageBrowserStatus" class="panel-note hidden"></p>
@@ -205,7 +200,7 @@
               </div>
               <form id="chatForm" class="chat-form">
                 <input id="chatInput" maxlength="300" placeholder="发送消息" autocomplete="off">
-                <button class="primary-pill" type="submit">发送</button>
+                <button class="primary-pill" type="submit" aria-label="发送" title="发送"><i class="icon icon-send" aria-hidden="true"></i></button>
               </form>
             </div>
           </aside>
@@ -226,7 +221,7 @@
             <div class="utility-card">
             <div class="section-head">
               <h3>sync node</h3>
-              <button id="refreshSyncNodesBtn" class="secondary-pill" type="button">刷新</button>
+              <button id="refreshSyncNodesBtn" class="pearl-button icon-only" type="button" aria-label="刷新" title="刷新"><i class="icon icon-refresh" aria-hidden="true"></i></button>
             </div>
             <form id="syncNodeForm" class="form-grid">
               <input id="syncNodeId" type="hidden">
@@ -287,7 +282,7 @@
             <div class="utility-card wide-card">
             <div class="section-head">
               <h3>节点完整配置</h3>
-              <button id="refreshNodeConfigBtn" class="secondary-pill" type="button">刷新</button>
+              <button id="refreshNodeConfigBtn" class="pearl-button icon-only" type="button" aria-label="刷新" title="刷新"><i class="icon icon-refresh" aria-hidden="true"></i></button>
             </div>
             <form id="nodeConfigForm" class="form-grid">
               <input id="nodeConfigOldUrl" type="hidden">
@@ -323,7 +318,7 @@
             <div class="utility-card wide-card">
             <div class="section-head">
               <h3>节点更新</h3>
-              <button id="refreshUpdateTargetsBtn" class="secondary-pill" type="button">刷新</button>
+              <button id="refreshUpdateTargetsBtn" class="pearl-button icon-only" type="button" aria-label="刷新" title="刷新"><i class="icon icon-refresh" aria-hidden="true"></i></button>
             </div>
             <form id="updateNodeForm" class="form-grid">
               <label class="wide"><span>已安装节点</span><select id="updateNodeSelect"></select></label>
@@ -337,7 +332,7 @@
             <div class="utility-card">
             <div class="section-head">
               <h3>存储节点</h3>
-              <button id="refreshStorageAdminBtn" class="secondary-pill" type="button">刷新</button>
+              <button id="refreshStorageAdminBtn" class="pearl-button icon-only" type="button" aria-label="刷新" title="刷新"><i class="icon icon-refresh" aria-hidden="true"></i></button>
             </div>
             <form id="storageNodeForm" class="form-grid">
               <input id="storageAdminNodeId" type="hidden">
@@ -356,11 +351,11 @@
               <h3>目录管理</h3>
               <div class="section-actions">
                 <select id="adminStorageSelect"></select>
-                <button id="refreshAdminStorageBtn" class="secondary-pill" type="button">刷新</button>
+                <button id="refreshAdminStorageBtn" class="pearl-button icon-only" type="button" aria-label="刷新" title="刷新"><i class="icon icon-refresh" aria-hidden="true"></i></button>
               </div>
             </div>
             <div class="manager-row">
-              <button id="adminStorageBackBtn" class="pearl-button" type="button">上级</button>
+              <button id="adminStorageBackBtn" class="pearl-button icon-only" type="button" aria-label="上级目录" title="上级目录"><i class="icon icon-back" aria-hidden="true"></i></button>
               <span id="adminStoragePath">/</span>
             </div>
             <form id="mkdirForm" class="inline-form">
@@ -378,7 +373,7 @@
             <div class="utility-card wide-card">
             <div class="section-head">
               <h3>离线下载</h3>
-              <button id="refreshDownloadTasksBtn" class="secondary-pill" type="button">刷新任务</button>
+              <button id="refreshDownloadTasksBtn" class="pearl-button icon-only" type="button" aria-label="刷新任务" title="刷新任务"><i class="icon icon-refresh" aria-hidden="true"></i></button>
             </div>
             <form id="downloadForm" class="form-grid">
               <label><span>存储节点</span><select id="downloadStorageSelect"></select></label>
