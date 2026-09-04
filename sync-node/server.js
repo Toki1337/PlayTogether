@@ -883,9 +883,14 @@ app.get('/emby/:grant/hls/{*splat}', requireRole('storage'), embyGrantMiddleware
   const grant = req.embyGrant;
   const rel = (Array.isArray(req.params.splat) ? req.params.splat.join('/') : String(req.params.splat || ''));
   const rawQuery = req.originalUrl.includes('?') ? req.originalUrl.slice(req.originalUrl.indexOf('?') + 1) : '';
-  if (/(^|\/)master\.m3u8$/i.test(rel)) {
+  // Validate the untrusted path first so a "../other-item/master.m3u8" cannot ride the master branch.
+  embyUpstreamUrl(grant, rel, '');
+  if (/^master\.m3u8$/i.test(rel)) {
     const session = await embyHlsSession(grant);
     const upstreamUrl = new URL(session.transcodingUrl, new URL(grant.baseUrl).origin);
+    // Emby stamps its own api_key on the transcoding URL; we authenticate by header instead so the
+    // token never travels in a URL, not even server-to-server.
+    stripEmbyAuthQuery(upstreamUrl.searchParams);
     return embyServePlaylist(grant, upstreamUrl, res);
   }
   const upstreamUrl = embyUpstreamUrl(grant, rel, rawQuery);
